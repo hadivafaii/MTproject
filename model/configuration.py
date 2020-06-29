@@ -16,7 +16,8 @@ class Config:
             dropout=0.0,
             initializer_range=0.02,
             layer_norm_eps=1e-12,
-            base_dir='Documents/PROJECTS/MT_LFP',
+            base_dir: str = 'Documents/PROJECTS/MT_LFP',
+            data_file: str = None,
     ):
         super(Config).__init__()
 
@@ -39,7 +40,10 @@ class Config:
         self.layer_norm_eps = layer_norm_eps
 
         self.base_dir = pjoin(os.environ['HOME'], base_dir)
-        self.data_file = pjoin(self.base_dir, 'python_processed', 'old_data_tres{:d}.h5'.format(temporal_res))
+        if data_file is None:
+            self.data_file = pjoin(self.base_dir, 'python_processed', 'old_data_tres{:d}.h5'.format(temporal_res))
+        else:
+            self.data_file = data_file
 
 
 class TrainConfig:

@@ -231,6 +231,10 @@ class MTTrainer:
 
         return preds_dict
 
+    def swap_model(self, new_model):
+        self.model = new_model.to(self.device)
+        self.model.reg_dicts_to_device(self.device)
+
     def setup_optim(self):
         if self.train_config.optim_choice == 'lamb':
             self.optim = Lamb(

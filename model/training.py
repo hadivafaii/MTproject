@@ -2,6 +2,7 @@ import numpy as np
 from tqdm import tqdm
 from os.path import join as pjoin
 from datetime import datetime
+from sklearn.metrics import r2_score
 
 import torch
 from torch.optim import Adam
@@ -13,7 +14,7 @@ from .dataset import create_datasets
 from .optimizer import Lamb, log_lamb_rs, ScheduledOptim
 
 import sys; sys.path.append('..')
-from utils.generic_utils import to_np, compute_reg_loss
+from utils.generic_utils import to_np, compute_reg_loss, get_null_adj_nll
 
 
 class MTTrainer:
@@ -60,25 +61,43 @@ class MTTrainer:
 
         self.model.train()
 
+        train_preds_dict, valid_preds_dict = {}, {}
         epochs_range = range(nb_epochs) if isinstance(nb_epochs, int) else nb_epochs
         for epoch in epochs_range:
-            self.iteration(self.train_loaders_dict, epoch=epoch, train=True)
+            self.iteration(self.train_loaders_dict, epoch=epoch)
 
             if (epoch + 1) % self.train_config.chkpt_freq == 0:
                 print('Saving chkpt:{:d}'.format(epoch+1))
+                train_preds_dict, valid_preds_dict = self.evaluate_model()
                 self.model.save('chkpt:{:d}'.format(epoch+1), comment=comment)
 
-    def valid(self):
-        self.model.eval()
-        with torch.no_grad():
-            for mode in self.pretrain_modes:
-                self.iteration(self.valid_loaders_dict, mode)
+        return train_preds_dict, valid_preds_dict
 
-    def iteration(self, dataloaders_dict, epoch=0, train=False):
+    def evaluate_model(self):
+        train_preds_dict = self.generante_prediction(mode='train')
+        valid_preds_dict = self.generante_prediction(mode='valid')
+
+        nnll_all = []
+        r2_all = []
+        for expt, (true, pred) in train_preds_dict.items():
+            nnll_all.append(get_null_adj_nll(true, pred))
+            r2_all.append(r2_score(true, pred, multioutput='raw_values') * 100)
+
+        print('avg train nnll: {:.3f}, r2: {:.2f} {}'.format(np.mean(nnll_all), np.mean(r2_all), '%'))
+
+        nnll_all = []
+        r2_all = []
+        for expt, (true, pred) in valid_preds_dict.items():
+            nnll_all.append(get_null_adj_nll(true, pred))
+            r2_all.append(r2_score(true, pred, multioutput='raw_values') * 100)
+
+        print('avg valid nnll: {:.3f}, r2: {:.2f} {}'.format(np.mean(nnll_all), np.mean(r2_all), '%'))
+
+        return train_preds_dict, valid_preds_dict
+
+    def iteration(self, dataloaders_dict, epoch=0):
         cuml_loss = 0.0
         cuml_reg_loss = 0.0
-        # cuml_gen_corrects = 0.0
-        # cuml_disc_corrects = 0.0
 
         data_iterators = {k: iter(v) for k, v in dataloaders_dict.items()}
         max_num_batches = max([len(dataloader) for dataloader in dataloaders_dict.values()])
@@ -107,7 +126,7 @@ class MTTrainer:
                 if (global_step + 1) % self.train_config.log_freq == 0:
                     # add losses to writerreinfor
                     for k, v in losses_dict.items():
-                        self.writer.add_scalar("{}/loss".format(k), v.item(), global_step)
+                        self.writer.add_scalar("loss/{}".format(k), v.item(), global_step)
 
                     # add optim state to writer
                     if self.train_config.optim_choice == 'adam_with_warmup':
@@ -136,15 +155,14 @@ class MTTrainer:
             final_loss = total_loss + total_reg_loss
 
             # backward and optimization only in train
-            if train:
-                if self.train_config.optim_choice == 'adam_with_warmup':
-                    self.optim_schedule.zero_grad()
-                    final_loss.backward()
-                    self.optim_schedule.step_and_update_lr()
-                else:
-                    self.optim.zero_grad()
-                    final_loss.backward()
-                    self.optim.step()
+            if self.train_config.optim_choice == 'adam_with_warmup':
+                self.optim_schedule.zero_grad()
+                final_loss.backward()
+                self.optim_schedule.step_and_update_lr()
+            else:
+                self.optim.zero_grad()
+                final_loss.backward()
+                self.optim.step()
 
             msg0 = 'epoch {:d}'.format(epoch)
             msg1 = ""
@@ -176,38 +194,38 @@ class MTTrainer:
         preds_dict = {}
 
         if mode == 'train':
-            for expt, loader in tqdm(self.train_loaders_dict.items()):
-                true_r = []
-                pred_r = []
+            for expt, loader in self.train_loaders_dict.items():
+                true_list = []
+                pred_list = []
 
                 for i, data_tuple in enumerate(loader):
                     with torch.no_grad():
                         pred = self.model(data_tuple[0].to(self.device, dtype=torch.float))
 
-                    true_r.append(data_tuple[1])
-                    pred_r.append(pred)
+                    true_list.append(data_tuple[1])
+                    pred_list.append(pred)
 
-                true_r = torch.cat(true_r)
-                pred_r = torch.cat(pred_r)
+                true = torch.cat(true_list)
+                pred = torch.cat(pred_list)
 
-                preds_dict.update({expt: (to_np(true_r), to_np(pred_r))})
+                preds_dict.update({expt: (to_np(true), to_np(pred))})
 
         elif mode == 'valid':
-            for expt, loader in tqdm(self.valid_loaders_dict.items()):
-                true_r = []
-                pred_r = []
+            for expt, loader in self.valid_loaders_dict.items():
+                true_list = []
+                pred_list = []
 
                 for i, data_tuple in enumerate(loader):
                     with torch.no_grad():
                         pred = self.model(data_tuple[0].to(self.device, dtype=torch.float))
 
-                    true_r.append(data_tuple[1])
-                    pred_r.append(pred)
+                    true_list.append(data_tuple[1])
+                    pred_list.append(pred)
 
-                true_r = torch.cat(true_r)
-                pred_r = torch.cat(pred_r)
+                true = torch.cat(true_list)
+                pred = torch.cat(pred_list)
 
-                preds_dict.update({expt: (to_np(true_r), to_np(pred_r))})
+                preds_dict.update({expt: (to_np(true), to_np(pred))})
         else:
             raise ValueError("Invalid mode: {}".format(mode))
 

@@ -62,7 +62,7 @@ class TrainConfig:
         super(TrainConfig).__init__()
 
         if regularization is None:
-            regularization = {'d2t': 1e-4, 'd2x': 1e-3}
+            regularization = {'d2t': 1e-4, 'd2x': 1e-4}
 
         if freeze_parameters_keywords is None:
             freeze_parameters_keywords = []

@@ -72,6 +72,15 @@ def plot_vel_field(data, fig_size=(14, 3), scale=None, estimate_center=True):
     plt.show()
 
 
+def compute_reg_loss(reg_vals, reg_mats, tensors):
+    reg_losses = {}
+    for reg_type, reg_val in reg_vals.items():
+        loss = reg_val * ((tensors[reg_type] @ reg_mats[reg_type]) ** 2).sum()
+        reg_losses.update({reg_type: loss})
+
+    return reg_losses
+
+
 def make_gif(data_to_plot, frames=None, interval=120, dt=25, fig_sz=(8, 6), dpi=100, sns_style=None,
              cmap='Greys', mode='stim', scales=None, file_name=None, save_dir='./gifs/', row_n=None, col_n=None):
     if sns_style is not None:

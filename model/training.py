@@ -12,9 +12,8 @@ from tensorboardX import SummaryWriter
 from .dataset import create_datasets
 from .optimizer import Lamb, log_lamb_rs, ScheduledOptim
 
-# import sys; sys.path.append('..')
-# from utils.gen_pretrain_data import load_data
-# from utils.utils import to_np
+import sys; sys.path.append('..')
+from utils.generic_utils import to_np, compute_reg_loss
 
 
 class MTTrainer:
@@ -28,6 +27,7 @@ class MTTrainer:
         self.device = torch.device("cuda" if cuda_condition else "cpu")
 
         self.model = model.to(self.device)
+        self.model.reg_dicts_to_device(self.device)
         self.train_config = train_config
         self.config = model.config
 
@@ -76,6 +76,7 @@ class MTTrainer:
 
     def iteration(self, dataloaders_dict, epoch=0, train=False):
         cuml_loss = 0.0
+        cuml_reg_loss = 0.0
         # cuml_gen_corrects = 0.0
         # cuml_disc_corrects = 0.0
 
@@ -104,7 +105,7 @@ class MTTrainer:
 
                 global_step = epoch * max_num_batches + i
                 if (global_step + 1) % self.train_config.log_freq == 0:
-                    # add losses to writer
+                    # add losses to writerreinfor
                     for k, v in losses_dict.items():
                         self.writer.add_scalar("{}/loss".format(k), v.item(), global_step)
 
@@ -114,7 +115,25 @@ class MTTrainer:
                     else:
                         log_lamb_rs(self.optim, self.writer, global_step)
 
-            final_loss = sum(x for x in losses_dict.values()) / len(losses_dict)
+            reg_tensors = {
+                'd2t': self.model.temporal_kernel.weight,
+                'd2x': self.model.spatial_kernel.weight,
+            }
+            reg_losses_dict = compute_reg_loss(
+                reg_vals=self.train_config.regularization,
+                reg_mats=self.model.reg_mats_dict,
+                tensors=reg_tensors)
+
+            global_step = epoch * max_num_batches + i
+            if (global_step + 1) % self.train_config.log_freq == 0:
+                for k, v in reg_losses_dict.items():
+                    self.writer.add_scalar("reg_loss/{}".format(k), v.item(), global_step)
+
+            total_loss = sum(x for x in losses_dict.values()) / len(losses_dict)
+            total_reg_loss = sum(x for x in reg_losses_dict.values()) / len(reg_losses_dict)
+            cuml_reg_loss += total_reg_loss.item()
+
+            final_loss = total_loss + total_reg_loss
 
             # backward and optimization only in train
             if train:
@@ -131,15 +150,19 @@ class MTTrainer:
             msg1 = ""
             for k, v in losses_dict.items():
                 msg1 += "{}: {:.3f}, ".format(k, v.item())
-            msg1 += "tot: {:.3f}".format(final_loss.item())
+            msg1 += "tot: {:.3f}, ".format(total_loss.item())
+            msg1 += "tot reg: {:.2e}".format(total_reg_loss.item())
 
             desc1 = msg0 + '\t|\t' + msg1
             pbar.set_description(desc1)
 
             global_step = epoch * max_num_batches + i
             if i + 1 == max_num_batches:
-                desc2 = 'epoch # {:d}, avg_loss: {:.4f}'
-                desc2 = desc2.format(epoch, cuml_loss / max_num_batches / len(dataloaders_dict))
+                desc2 = 'epoch # {:d}, avg loss: {:.5f}, avg reg loss: {:.5f}'
+                desc2 = desc2.format(
+                    epoch,
+                    cuml_loss / max_num_batches / len(dataloaders_dict),
+                    cuml_reg_loss / max_num_batches / len(self.train_config.regularization))
                 pbar.set_description(desc2)
 
                 # self.writer.add_embedding(
@@ -147,6 +170,48 @@ class MTTrainer:
                 #   metadata=list(self.model.nlp.i2w.values()),
                 #   global_step=global_step,
                 #   tag='word_emb')
+
+    def generante_prediction(self, mode='train'):
+        self.model.eval()
+        preds_dict = {}
+
+        if mode == 'train':
+            for expt, loader in tqdm(self.train_loaders_dict.items()):
+                true_r = []
+                pred_r = []
+
+                for i, data_tuple in enumerate(loader):
+                    with torch.no_grad():
+                        pred = self.model(data_tuple[0].to(self.device, dtype=torch.float))
+
+                    true_r.append(data_tuple[1])
+                    pred_r.append(pred)
+
+                true_r = torch.cat(true_r)
+                pred_r = torch.cat(pred_r)
+
+                preds_dict.update({expt: (to_np(true_r), to_np(pred_r))})
+
+        elif mode == 'valid':
+            for expt, loader in tqdm(self.valid_loaders_dict.items()):
+                true_r = []
+                pred_r = []
+
+                for i, data_tuple in enumerate(loader):
+                    with torch.no_grad():
+                        pred = self.model(data_tuple[0].to(self.device, dtype=torch.float))
+
+                    true_r.append(data_tuple[1])
+                    pred_r.append(pred)
+
+                true_r = torch.cat(true_r)
+                pred_r = torch.cat(pred_r)
+
+                preds_dict.update({expt: (to_np(true_r), to_np(pred_r))})
+        else:
+            raise ValueError("Invalid mode: {}".format(mode))
+
+        return preds_dict
 
     def setup_optim(self):
         if self.train_config.optim_choice == 'lamb':

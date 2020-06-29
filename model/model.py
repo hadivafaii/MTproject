@@ -5,6 +5,7 @@ from copy import deepcopy as dc
 from prettytable import PrettyTable
 from os.path import join as pjoin
 from tqdm import tqdm
+import numpy as np
 
 import torch
 from torch import nn
@@ -32,6 +33,7 @@ class MTLayer(nn.Module):
         self.spatial_kernel = nn.Linear(config.grid_size ** 2, 1, bias=True)
 
         self.criterion = nn.PoissonNLLLoss(log_input=False)
+        self.reg_mats_dict = self._create_reg_mat()
         self.activation = _get_activation_fn(config.activation_fn)
 
         self.init_weights()
@@ -39,8 +41,7 @@ class MTLayer(nn.Module):
         self.print_num_params()
 
     def forward(self, x):
-        x = x.squeeze(1)    # single cell (that dimension is num stim = num expts)
-        rho = torch.sqrt(x[..., 0] ** 2 + x[..., 1] ** 2)
+        rho = torch.norm(x, dim=-1)
 
         # angular component
         f_theta = torch.exp(self.dir_tuning(x).squeeze(-1) / rho.masked_fill(rho == 0., 1e-8))
@@ -188,6 +189,31 @@ class MTLayer(nn.Module):
         loaded_model.load_state_dict(torch.load(pjoin(load_dir, 'model.bin')))
 
         return loaded_model
+
+    def _create_reg_mat(self):
+        temporal_mat = (
+                np.diag([1] * (self.config.time_lags - 1), k=-1) +
+                np.diag([-2] * self.config.time_lags, k=0) +
+                np.diag([1] * (self.config.time_lags - 1), k=1)
+        )
+
+        d1 = (
+                np.diag([1] * (self.config.grid_size - 1), k=-1) +
+                np.diag([-2] * self.config.grid_size, k=0) +
+                np.diag([1] * (self.config.grid_size - 1), k=1)
+        )
+        spatial_mat = np.kron(np.eye(self.config.grid_size), d1) + np.kron(d1, np.eye(self.config.grid_size))
+
+        reg_mats_dict = {
+            'd2t': torch.tensor(temporal_mat, dtype=torch.float),
+            'd2x': torch.tensor(spatial_mat, dtype=torch.float),
+        }
+
+        return reg_mats_dict
+
+    def reg_dicts_to_device(self, device):
+        for reg_type, reg_mat in self.reg_mats_dict.items():
+            self.reg_mats_dict[reg_type] = reg_mat.to(device)
 
 
 def _get_activation_fn(activation):

@@ -46,6 +46,7 @@ class TrainConfig:
     def __init__(
             self,
             optim_choice='adam_with_warmup',
+            regularization: dict = None,
             lr=1e-3,
             betas=(0.9, 0.999),
             weight_decay: float = 0.01,
@@ -60,12 +61,17 @@ class TrainConfig:
     ):
         super(TrainConfig).__init__()
 
+        if regularization is None:
+            regularization = {'d2t': 1e-4, 'd2x': 1e-3}
+
         if freeze_parameters_keywords is None:
             freeze_parameters_keywords = []
+
         _allowed_optim_choices = ['lamb', 'adam', 'adam_with_warmup']
         assert optim_choice in _allowed_optim_choices, "Invalid optimzer choice, allowed options:\n{}".format(_allowed_optim_choices)
 
         self.optim_choice = optim_choice
+        self.regularization = regularization
         self.lr = lr
         self.betas = betas
         self.weight_decay = weight_decay

@@ -59,7 +59,7 @@ def _load_data(config):
         good_indxs = np.where(goodspks == 1)[0]
         good_indxs = good_indxs[good_indxs > config.time_lags]
 
-        stim = np.array(grp['stim'])
+        stim = np.transpose(np.array(grp['stim']), (0, -1, 1, 2))   # nt x 2 x grd x grd
         nt = len(stim)
         num_channels = np.array(grp['num_channels']).item()
         spks = np.zeros((nt, num_channels))

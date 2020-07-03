@@ -11,16 +11,18 @@ class Config:
             grid_size: int = 15,
             temporal_res: int = 25,
             time_lags: int = 40,
-            vel_tuning_num_units: List[int] = None,
-            activation_fn: str = 'softplus',
-            dropout=0.0,
             initializer_range=0.02,
-            layer_norm_eps=1e-12,
+            multicell: bool = True,
+            nb_vel_tuning_units: List[int] = None,
+            activation_fn: str = 'softplus',
+            nb_spatial_blocks: int = 3,
+            dropout=0.1,
             base_dir: str = 'Documents/PROJECTS/MT_LFP',
             data_file: str = None,
     ):
         super(Config).__init__()
 
+        # generic configs
         if experiment_names is not None and not isinstance(experiment_names, list):
             experiment_names = [experiment_names]
         self.experiment_names = experiment_names
@@ -28,17 +30,20 @@ class Config:
         self.grid_size = grid_size
         self.temporal_res = temporal_res
         self.time_lags = time_lags
-
-        if vel_tuning_num_units is None:
-            self.vel_tuning_num_units = [10, 10, 10, 10, 10]
-        else:
-            self.vel_tuning_num_units = vel_tuning_num_units
-
-        self.activation_fn = activation_fn
-        self.dropout = dropout
         self.initializer_range = initializer_range
-        self.layer_norm_eps = layer_norm_eps
 
+        self.multicell = multicell
+        # single cell configs
+        if nb_vel_tuning_units is None:
+            self.nb_vel_tuning_units = [10, 10, 10, 10, 10]
+        else:
+            self.nb_vel_tuning_units = nb_vel_tuning_units
+        # multicell or shared configs
+        self.activation_fn = activation_fn
+        self.nb_spatial_blocks = nb_spatial_blocks
+        self.dropout = dropout
+
+        # dir configs
         self.base_dir = pjoin(os.environ['HOME'], base_dir)
         if data_file is None:
             self.data_file = pjoin(self.base_dir, 'python_processed', 'old_data_tres{:d}.h5'.format(temporal_res))

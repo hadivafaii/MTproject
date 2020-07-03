@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from tqdm import tqdm
 from os.path import join as pjoin
@@ -19,7 +20,7 @@ from utils.generic_utils import to_np, compute_reg_loss, get_null_adj_nll
 
 class MTTrainer:
     def __init__(self, model, train_config, seed=665):
-
+        os.environ["SEED"] = str(seed)
         torch.manual_seed(seed)
         np.random.seed(seed)
         self.rng = np.random.RandomState(seed)

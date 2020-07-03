@@ -35,7 +35,7 @@ def get_null_adj_nll(true, pred):
     return -nll + null_nll
 
 
-def plot_vel_field(data, fig_size=(14, 3), scale=None, estimate_center=True):
+def plot_vel_field(data, fig_size=(14, 3), scale=None, save_file=None, estimate_center=True):
     grd = data.shape[0]
     xx, yy = np.mgrid[0:grd, 0:grd]
     uu, vv = data[..., 0], data[..., 1]
@@ -62,6 +62,9 @@ def plot_vel_field(data, fig_size=(14, 3), scale=None, estimate_center=True):
     plt.ylim(-1, grd)
     plt.axis('image')
 
+    if save_file is not None:
+        plt.savefig(save_file, facecolor='white')
+
     if estimate_center:
         ctr_y, ctr_x = np.unravel_index(np.argmax(cc), (grd, grd))
         plt.plot(ctr_y, ctr_x, 'r.', markersize=10)
@@ -70,6 +73,8 @@ def plot_vel_field(data, fig_size=(14, 3), scale=None, estimate_center=True):
         return ctr_y, ctr_x
 
     plt.show()
+
+    return
 
 
 def compute_reg_loss(reg_vals, reg_mats, tensors):

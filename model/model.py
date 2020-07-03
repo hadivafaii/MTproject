@@ -15,15 +15,20 @@ from torch.optim import Adam
 from .configuration import Config
 
 
+class TemporalBlock(nn.Module):
+    def __init__(self, time_lags):
+        super(TemporalBlock, self).__init__()
+
+
 class MTLayer(nn.Module):
     def __init__(self, config):
         super(MTLayer, self).__init__()
 
         self.config = config
 
-        num_units = [1] + config.vel_tuning_num_units + [1]
+        num_units = [1] + config.nb_vel_tuning_units + [1]
         layers = []
-        for i in range(len(config.vel_tuning_num_units) + 1):
+        for i in range(len(config.nb_vel_tuning_units) + 1):
             layers += [nn.Conv2d(num_units[i], num_units[i + 1], 1), nn.ReLU()]
 
         self.vel_tuning = nn.Sequential(*layers)
@@ -41,6 +46,7 @@ class MTLayer(nn.Module):
         self.print_num_params()
 
     def forward(self, x):
+        x = x.permute(0, 1, 3, 4, 2)   # N x tau x grd x grd x 2
         rho = torch.norm(x, dim=-1)
 
         # angular component

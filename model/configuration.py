@@ -11,12 +11,16 @@ class Config:
             grid_size: int = 15,
             temporal_res: int = 25,
             time_lags: int = 40,
-            initializer_range=0.02,
+            initializer_range: float = 0.02,
             multicell: bool = True,
             nb_vel_tuning_units: List[int] = None,
             activation_fn: str = 'softplus',
+            spatial_kernel_size: int = 7,
+            temporal_kernel_size: int = 3,
+            nb_spatial_units: int = None,
+            nb_temporal_units: int = None,
             nb_spatial_blocks: int = 3,
-            dropout=0.1,
+            dropout: float = 0.1,
             base_dir: str = 'Documents/PROJECTS/MT_LFP',
             data_file: str = None,
     ):
@@ -41,6 +45,16 @@ class Config:
         # multicell or shared configs
         self.activation_fn = activation_fn
         self.nb_spatial_blocks = nb_spatial_blocks
+        self.spatial_kernel_size = spatial_kernel_size
+        self.temporal_kernel_size = temporal_kernel_size
+        if nb_spatial_units is None:
+            self.nb_spatial_units = [10]
+        else:
+            self.nb_spatial_units = nb_spatial_units
+        if nb_temporal_units is None:
+            self.nb_temporal_units = [5, 5, 5]
+        else:
+            self.nb_temporal_units = nb_temporal_units
         self.dropout = dropout
 
         # dir configs

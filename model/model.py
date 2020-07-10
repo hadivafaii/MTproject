@@ -6,18 +6,153 @@ from prettytable import PrettyTable
 from os.path import join as pjoin
 from tqdm import tqdm
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Tuple
 
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.utils import weight_norm
 from torch.optim import Adam
 
 from .configuration import Config
 
 
+class RotConv2d(nn.Conv2d):
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: [int, Tuple[int]],
+            nb_rotations: int = 8,
+            stride: int = 1,
+            padding: int = None,
+            dilation: int = 1,
+            groups: int = 1,
+            bias: bool = True,
+            padding_mode: str = 'zeros',
+    ):
+
+        if padding is None:
+            try:
+                padding = kernel_size - 1
+            except TypeError:
+                padding = max(kernel_size) - 1
+
+        super(RotConv2d, self).__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+            padding_mode=padding_mode)
+
+        self.nb_rotations = nb_rotations
+        self.rotation_mat = None
+        self._build_rotation_mat()
+
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(out_channels * nb_rotations))
+
+    def forward(self, x):
+        augmented_weight = self.get_augmented_weight()
+        return self._conv_forward(x, augmented_weight)
+
+    def _build_rotation_mat(self):
+        thetas = np.deg2rad(np.arange(0, 360, 360 / self.nb_rotations))
+        c, s = np.cos(thetas), np.sin(thetas)
+        self.rotation_mat = torch.tensor([[c, -s], [s, c]], dtype=torch.float).permute(2, 0, 1)
+
+    def get_augmented_weight(self):
+        w = [torch.einsum('ijk, klm -> ijlm', self.rotation_mat, self.weight[i]) for i in range(self.out_channels)]
+        w = torch.cat(w)
+        return w
+
+
+# TODO
+class SpatialBlock(nn.Module):
+    pass
+
+
+class SpatialConvNet(nn.Module):
+    pass
+
+
 class TemporalBlock(nn.Module):
-    def __init__(self, time_lags):
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.1):
         super(TemporalBlock, self).__init__()
+        self.conv1 = weight_norm(nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                                           stride=stride, padding=padding, dilation=dilation))
+        self.chomp1 = Chomp(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = weight_norm(nn.Conv1d(n_outputs, n_outputs, kernel_size,
+                                           stride=stride, padding=padding, dilation=dilation))
+        self.chomp2 = Chomp(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1,
+                                 self.conv2, self.chomp2, self.relu2, self.dropout2)
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.relu = nn.ReLU()
+        self.init_weights()
+
+    def init_weights(self):
+        self.conv1.weight.data.normal_(0, 0.01)
+        self.conv2.weight.data.normal_(0, 0.01)
+        if self.downsample is not None:
+            self.downsample.weight.data.normal_(0, 0.01)
+
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class TemporalConvNet(nn.Module):
+    def __init__(self, num_inputs, config):
+        super(TemporalConvNet, self).__init__()
+        layers = []
+        num_levels = len(config.nb_temporal_units)
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = num_inputs if i == 0 else config.nb_temporal_units[i-1]
+            out_channels = config.nb_temporal_units[i]
+            layers += [TemporalBlock(
+                n_inputs=in_channels,
+                n_outputs=out_channels,
+                kernel_size=config.temporal_kernel_size,
+                stride=1,
+                dilation=dilation_size,
+                padding=(config.temporal_kernel_size-1) * dilation_size,
+                dropout=config.dropout),
+            ]
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+
+
+class Chomp(nn.Module):
+    def __init__(self, chomp_size, nb_dims):
+        super(Chomp, self).__init__()
+        self.chomp_size = chomp_size
+        self.nb_dims = nb_dims
+
+    def forward(self, x):
+        if self.nb_dims == 1:
+            return x[:, :, :-self.chomp_size].contiguous()
+        elif self.nb_dims == 2:
+            return x[:, :, :-self.chomp_size, :-self.chomp_size].contiguous()
+        else:
+            raise RuntimeError("Invalid number of dims")
 
 
 class MTLayer(nn.Module):
@@ -132,6 +267,45 @@ class MTLayer(nn.Module):
                 else:
                     t.add_row([name, "{}".format(total_params)])
         print(t, '\n\n')
+
+    def visualize(self, xv_nnll, xv_r2, save=False):
+        dir_tuning = self.dir_tuning.weight.data.flatten().cpu().numpy()
+        b_abs = np.linalg.norm(dir_tuning)
+        theta = np.arccos(dir_tuning[1] / b_abs)
+
+        tker = self.temporal_kernel.weight.data.flatten().cpu().numpy()
+        sker = self.spatial_kernel.weight.data.view(self.config.grid_size, self.config.grid_size).cpu().numpy()
+
+        if max(tker, key=abs) < 0:
+            tker *= -1
+            sker *= -1
+
+        sns.set_style('dark')
+        plt.figure(figsize=(16, 4))
+        plt.subplot(121)
+        t_rng = np.array([39, 36, 32, 27, 22, 15, 7, 0])
+        plt.xticks(t_rng, (self.config.time_lags - t_rng - 1) * -self.config.temporal_res)
+        plt.xlabel('Time (ms)', fontsize=25)
+        plt.plot(tker)
+        plt.grid()
+        plt.subplot(122)
+        plt.imshow(sker, cmap='bwr')
+        plt.colorbar()
+
+        plt.suptitle(
+            '$\\theta_p = $ %.2f deg,     b_abs = %.4f     . . .     xv_nnll:  %.4f,       xv_r2:  %.2f %s'
+            % (np.rad2deg(theta), b_abs, xv_nnll, xv_r2, '%'), fontsize=15)
+
+        if save:
+            result_save_dir = os.path.join(self.config.base_dir, 'results/PyTorch')
+            os.makedirs(result_save_dir, exist_ok=True)
+            save_name = os.path.join(
+                result_save_dir,
+                'DS_GLM_{:s}_{:s}.png'.format(self.config.experiment_names, datetime.now().strftime("[%Y_%m_%d_%H:%M]"))
+            )
+            plt.savefig(save_name, facecolor='white')
+
+        plt.show()
 
     def save(self, prefix=None, comment=None):
         config_dict = vars(self.config)

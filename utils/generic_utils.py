@@ -21,20 +21,6 @@ def convert_time(time_in_secs):
     print("\nd / hh:mm:ss   --->   %d / %d:%d:%d\n" % (d, h, m, s))
 
 
-def get_nll(true, pred):
-    _eps = np.finfo(np.float32).eps
-    return np.sum(pred - true * np.log(pred + _eps), axis=0) / np.sum(true, axis=0)
-
-
-def get_null_adj_nll(true, pred):
-    nll = get_nll(true, pred)
-
-    r_0 = true.mean(0)
-    null_nll = get_nll(true, r_0)
-
-    return -nll + null_nll
-
-
 def plot_vel_field(data, fig_size=(14, 3), scale=None, save_file=None, estimate_center=True):
     grd = data.shape[0]
     xx, yy = np.mgrid[0:grd, 0:grd]
@@ -75,15 +61,6 @@ def plot_vel_field(data, fig_size=(14, 3), scale=None, save_file=None, estimate_
     plt.show()
 
     return
-
-
-def compute_reg_loss(reg_vals, reg_mats, tensors):
-    reg_losses = {}
-    for reg_type, reg_val in reg_vals.items():
-        loss = reg_val * ((tensors[reg_type] @ reg_mats[reg_type]) ** 2).sum()
-        reg_losses.update({reg_type: loss})
-
-    return reg_losses
 
 
 def make_gif(data_to_plot, frames=None, interval=120, dt=25, fig_sz=(8, 6), dpi=100, sns_style=None,

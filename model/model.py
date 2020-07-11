@@ -1,22 +1,196 @@
 import os
-import yaml
 from datetime import datetime
-from copy import deepcopy as dc
-from prettytable import PrettyTable
 from os.path import join as pjoin
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from typing import Tuple
+from typing import Tuple, Union
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 from torch.optim import Adam
 
-from .configuration import Config
+from .model_utils import create_reg_mat, print_num_params, get_activation_fn
+
+
+class MTNet(nn.Module):
+    def __init__(self, config):
+        super(MTNet, self).__init__()
+        assert config.multicell, "For multicell modeling only"
+
+        self.config = config
+
+        self.core = MTRotatioanlConvCore(config)
+        self.readout = MTReadout(config, self.core.output_size)
+
+        self.criterion = nn.PoissonNLLLoss(log_input=False)
+        self.reg_mats_dict = create_reg_mat(config.time_lags, self.core.rot_conv2d.kernel_size[0])
+
+        self.init_weights()
+        print_num_params(self)
+
+    def forward(self, x, experiment_name: str):
+        out_core = self.core(x)[-1].squeeze()
+        out = self.readout(out_core, experiment_name)
+
+        return out
+
+    def init_weights(self):
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """ Initialize the weights """
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
+    def extras_to_device(self, device):
+        for reg_type, reg_mat in self.reg_mats_dict.items():
+            self.reg_mats_dict[reg_type] = reg_mat.to(device)
+        self.core.rot_conv2d.rot_mat_to_device(device)
+
+
+class MTReadout(nn.Module):
+    def __init__(self, config, hidden_size):
+        super(MTReadout, self).__init__()
+
+        load = os.path.join(config.base_dir, 'extra_info', "nb_cells_dict.npy")
+        self.nb_cells_dict = np.load(load, allow_pickle=True).item()
+
+        self.config = config
+        self.hidden_size = hidden_size
+
+        self.norm = nn.LayerNorm(hidden_size, config.layer_norm_eps)
+
+        layers = {}
+        # noinspection PyUnresolvedReferences
+        for expt, nb_cells in self.nb_cells_dict.items():
+            layers.update({expt: nn.Linear(hidden_size, nb_cells, bias=True)})
+        self.layers = nn.ModuleDict(layers)
+
+        self.activation = get_activation_fn(config.readout_activation_fn)
+        print_num_params(self)
+
+    def forward(self, x, experiment_name: str):
+        # inout is N x hidden_size
+        x = self.norm(x)
+        y = self.layers[experiment_name](x)
+        y = self.activation(y)
+
+        return y
+
+
+class MTRotatioanlConvCore(nn.Module):
+    def __init__(self, config):
+        super(MTRotatioanlConvCore, self).__init__()
+
+        self.config = config
+
+        self.num_temporal_kernels = 4
+
+        self.rot_conv2d = weight_norm(RotConv2d(
+            in_channels=2,
+            out_channels=config.nb_rot_kernels,
+            nb_rotations=config.nb_rotations,
+            kernel_size=config.rot_kernel_size,
+            padding=config.rot_kernel_size - 1))
+        self.rot_chomp = Chomp(chomp_size=config.rot_kernel_size - 1, nb_dims=2)
+
+        self.temporal_fc = nn.Linear(config.time_lags, self.num_temporal_kernels, bias=False)
+
+        sker_size = 3
+        num_convs = [128, 256, 512]
+
+        self.chomp = Chomp(chomp_size=sker_size - 1, nb_dims=2)
+
+        self.pool0 = nn.AdaptiveAvgPool2d(config.grid_size // 2)
+        self.conv1 = weight_norm(nn.Conv2d(
+            in_channels=config.nb_rotations * config.nb_rot_kernels * self.num_temporal_kernels,
+            out_channels=num_convs[0],
+            kernel_size=sker_size,
+            padding=sker_size - 1))
+        # self.dropout1 = nn.Dropout(config.dropout)
+        if config.nb_rotations * config.nb_rot_kernels * self.num_temporal_kernels != num_convs[0]:
+            self.downsample1 = nn.Conv2d(
+                in_channels=config.nb_rotations * config.nb_rot_kernels * self.num_temporal_kernels,
+                out_channels=num_convs[0],
+                kernel_size=1)
+        else:
+            self.downsample1 = None
+
+        self.pool1 = nn.AdaptiveAvgPool2d(config.grid_size // 4)
+        self.conv2 = weight_norm(nn.Conv2d(
+            in_channels=num_convs[0],
+            out_channels=num_convs[1],
+            kernel_size=sker_size,
+            padding=sker_size - 1))
+        # self.dropout2 = nn.Dropout(config.dropout)
+        if num_convs[0] != num_convs[1]:
+            self.downsample2 = nn.Conv2d(
+                in_channels=num_convs[0],
+                out_channels=num_convs[1],
+                kernel_size=1)
+        else:
+            self.downsample2 = None
+
+        self.pool2 = nn.AdaptiveAvgPool2d(config.grid_size // 8)
+        self.conv3 = weight_norm(nn.Conv2d(
+            in_channels=num_convs[1],
+            out_channels=num_convs[2],
+            kernel_size=sker_size,
+            padding=sker_size - 1))
+        # self.dropout3 = nn.Dropout(config.dropout)
+        if num_convs[1] != num_convs[2]:
+            self.downsample3 = nn.Conv2d(
+                in_channels=num_convs[1],
+                out_channels=num_convs[2],
+                kernel_size=1)
+        else:
+            self.downsample3 = None
+
+        self.output_size = num_convs[-1]
+        self.activation = get_activation_fn(config.core_activation_fn)
+        print_num_params(self)
+
+    def forward(self, x):
+        x0 = self._rot_st_fwd(x)
+        x0_pool = self.pool0(x0)
+
+        x1 = self.chomp(self.conv1(x0_pool))
+        x1 = self.activation(x1 + self.downsample1(x0_pool))
+        x1_pool = self.pool1(x1)
+
+        x2 = self.chomp(self.conv2(x1_pool))
+        x2 = self.activation(x2 + self.downsample2(x1_pool))
+        x2_pool = self.pool2(x2)
+
+        x3 = self.chomp(self.conv3(x2_pool))
+        x3 = self.activation(x3 + self.downsample3(x2_pool))
+        # x3_pool = self.pool3(x3)
+
+        return [x0, x1, x2, x3]
+
+    def _rot_st_fwd(self, x):
+        # temporal part
+        x = x.permute(0, 2, 3, 4, 1)  # N x 2 x grd x grd x tau
+        x = self.temporal_fc(x).permute(0, -1, 1, 2, 3)  # N x nb_temporal_kernels x 2 x grd x grd
+        x = x.flatten(end_dim=1)  # N * nb_temporal_kernels x 2 x grd x grd
+
+        # spatial part
+        x = self.rot_chomp(self.rot_conv2d(x))  # N * nb_temporal_kernels x nb_rot * nb_rot_kers x grd x grd
+        x = x.view(
+            -1, self.num_temporal_kernels,
+            self.config.nb_rotations * self.config.nb_rot_kernels,
+            self.config.grid_size, self.config.grid_size)  # N x nb_temporal_kernels x nb_rot * nb_rot_kers x grd x grd
+        x = x.flatten(start_dim=1, end_dim=2)  # N x C x grd x grd
+
+        return self.activation(x)
 
 
 class RotConv2d(nn.Conv2d):
@@ -24,7 +198,7 @@ class RotConv2d(nn.Conv2d):
             self,
             in_channels: int,
             out_channels: int,
-            kernel_size: [int, Tuple[int]],
+            kernel_size: Union[int, Tuple[int, int]],
             nb_rotations: int = 8,
             stride: int = 1,
             padding: int = None,
@@ -56,7 +230,8 @@ class RotConv2d(nn.Conv2d):
         self._build_rotation_mat()
 
         if bias:
-            self.bias = nn.Parameter(torch.Tensor(out_channels * nb_rotations))
+            self.bias = nn.Parameter(
+                torch.Tensor(out_channels * nb_rotations))
 
     def forward(self, x):
         augmented_weight = self.get_augmented_weight()
@@ -65,10 +240,15 @@ class RotConv2d(nn.Conv2d):
     def _build_rotation_mat(self):
         thetas = np.deg2rad(np.arange(0, 360, 360 / self.nb_rotations))
         c, s = np.cos(thetas), np.sin(thetas)
-        self.rotation_mat = torch.tensor([[c, -s], [s, c]], dtype=torch.float).permute(2, 0, 1)
+        self.rotation_mat = torch.tensor(
+            [[c, -s], [s, c]], dtype=torch.float).permute(2, 0, 1)
+
+    def rot_mat_to_device(self, device):
+        self.rotation_mat = self.rotation_mat.to(device)
 
     def get_augmented_weight(self):
-        w = [torch.einsum('ijk, klm -> ijlm', self.rotation_mat, self.weight[i]) for i in range(self.out_channels)]
+        w = [torch.einsum('ijk, klm -> ijlm', self.rotation_mat, self.weight[i])
+             for i in range(self.out_channels)]
         w = torch.cat(w)
         return w
 
@@ -101,13 +281,13 @@ class TemporalBlock(nn.Module):
                                  self.conv2, self.chomp2, self.relu2, self.dropout2)
         self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
         self.relu = nn.ReLU()
-        self.init_weights()
+        # self.init_weights()
 
-    def init_weights(self):
-        self.conv1.weight.data.normal_(0, 0.01)
-        self.conv2.weight.data.normal_(0, 0.01)
-        if self.downsample is not None:
-            self.downsample.weight.data.normal_(0, 0.01)
+    #  def init_weights(self):
+    #    self.conv1.weight.data.normal_(0, 0.02)
+    #    self.conv2.weight.data.normal_(0, 0.02)
+    #    if self.downsample is not None:
+    #        self.downsample.weight.data.normal_(0, 0.02)
 
     def forward(self, x):
         out = self.net(x)
@@ -134,6 +314,7 @@ class TemporalConvNet(nn.Module):
                 dropout=config.dropout),
             ]
 
+        self.out_chanels = config.nb_temporal_units[-1]
         self.network = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -158,7 +339,7 @@ class Chomp(nn.Module):
 class MTLayer(nn.Module):
     def __init__(self, config):
         super(MTLayer, self).__init__()
-
+        assert not config.multicell, "For single cell modeling only"
         self.config = config
 
         num_units = [1] + config.nb_vel_tuning_units + [1]
@@ -173,12 +354,12 @@ class MTLayer(nn.Module):
         self.spatial_kernel = nn.Linear(config.grid_size ** 2, 1, bias=True)
 
         self.criterion = nn.PoissonNLLLoss(log_input=False)
-        self.reg_mats_dict = self._create_reg_mat()
-        self.activation = _get_activation_fn(config.activation_fn)
+        self.reg_mats_dict = create_reg_mat(config.time_lags, config.grid_size)
+        self.activation = get_activation_fn(config.readout_activation_fn)
 
         self.init_weights()
-        self.load_vel_tuning()
-        self.print_num_params()
+        self._load_vel_tuning()
+        print_num_params(self)
 
     def forward(self, x):
         x = x.permute(0, 1, 3, 4, 2)   # N x tau x grd x grd x 2
@@ -213,11 +394,8 @@ class MTLayer(nn.Module):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
 
-    def load_vel_tuning(self):
+    def _load_vel_tuning(self):
         _dir = pjoin(os.environ['HOME'], 'Documents/PROJECTS/MT_LFP/vel_dir_weights')
         try:
             print('[INFO] loading vel tuning identity weights')
@@ -255,18 +433,9 @@ class MTLayer(nn.Module):
 
         print('[INFO] training vel tuning identity weights done')
 
-    def print_num_params(self):
-        t = PrettyTable(['Module Name', 'Num Params'])
-
-        for name, m in self.named_modules():
-            total_params = sum(p.numel() for p in m.parameters() if p.requires_grad)
-            if '.' not in name:
-                if isinstance(m, type(self)):
-                    t.add_row(["Total", "{}".format(total_params)])
-                    t.add_row(['---', '---'])
-                else:
-                    t.add_row([name, "{}".format(total_params)])
-        print(t, '\n\n')
+    def extras_to_device(self, device):
+        for reg_type, reg_mat in self.reg_mats_dict.items():
+            self.reg_mats_dict[reg_type] = reg_mat.to(device)
 
     def visualize(self, xv_nnll, xv_r2, save=False):
         dir_tuning = self.dir_tuning.weight.data.flatten().cpu().numpy()
@@ -306,100 +475,3 @@ class MTLayer(nn.Module):
             plt.savefig(save_name, facecolor='white')
 
         plt.show()
-
-    def save(self, prefix=None, comment=None):
-        config_dict = vars(self.config)
-        # data_config_dict = vars(self.data_config)
-
-        to_hash_dict_ = dc(config_dict)
-        # to_hash_dict_.update(data_config_dict)
-        hashed_info = str(hash(frozenset(sorted(to_hash_dict_))))
-
-        if prefix is None:
-            prefix = 'chkpt:0'
-
-        save_dir = pjoin(
-            self.config.base_dir,
-            'saved_models',
-            "[{}_{:s}]".format(comment, hashed_info),
-            "{}_{:s}".format(prefix, datetime.now().strftime("[%Y_%m_%d_%H:%M]")))
-
-        os.makedirs(save_dir, exist_ok=True)
-
-        torch.save(self.state_dict(), pjoin(save_dir, 'model.bin'))
-
-        with open(pjoin(save_dir, 'config.yaml'), 'w') as f:
-            yaml.dump(config_dict, f)
-
-        # with open(pjoin(save_dir, 'data_config.yaml'), 'w') as f:
-        #    yaml.dump(data_config_dict, f)
-
-    @staticmethod
-    def load(model_id=-1, chkpt_id=-1, config=None, load_dir=None, verbose=True):
-        if load_dir is None:
-            _dir = pjoin(os.environ['HOME'], 'Documents/PROJECTS/MT_LFP/saved_models')
-            available_models = os.listdir(_dir)
-            if verbose:
-                print('Available models to load:\n', available_models)
-            model_dir = pjoin(_dir, available_models[model_id])
-            available_chkpts = os.listdir(model_dir)
-            if verbose:
-                print('\nAvailable chkpts to load:\n', available_chkpts)
-            load_dir = pjoin(model_dir, available_chkpts[chkpt_id])
-
-        if verbose:
-            print('\nLoading from:\n{}\n'.format(load_dir))
-
-        if config is None:
-            with open(pjoin(load_dir, 'config.yaml'), 'r') as stream:
-                try:
-                    config_dict = yaml.safe_load(stream)
-                except yaml.YAMLError as exc:
-                    print(exc)
-            config = Config(**config_dict)
-
-        # if data_config is None:
-        #    with open(pjoin(load_dir, 'data_config.yaml'), 'r') as stream:
-        #        try:
-        #            data_config_dict = yaml.safe_load(stream)
-        #        except yaml.YAMLError as exc:
-        #            print(exc)
-
-        loaded_model = MTLayer(config)
-        loaded_model.load_state_dict(torch.load(pjoin(load_dir, 'model.bin')))
-
-        return loaded_model
-
-    def _create_reg_mat(self):
-        temporal_mat = (
-                np.diag([1] * (self.config.time_lags - 1), k=-1) +
-                np.diag([-2] * self.config.time_lags, k=0) +
-                np.diag([1] * (self.config.time_lags - 1), k=1)
-        )
-
-        d1 = (
-                np.diag([1] * (self.config.grid_size - 1), k=-1) +
-                np.diag([-2] * self.config.grid_size, k=0) +
-                np.diag([1] * (self.config.grid_size - 1), k=1)
-        )
-        spatial_mat = np.kron(np.eye(self.config.grid_size), d1) + np.kron(d1, np.eye(self.config.grid_size))
-
-        reg_mats_dict = {
-            'd2t': torch.tensor(temporal_mat, dtype=torch.float),
-            'd2x': torch.tensor(spatial_mat, dtype=torch.float),
-        }
-
-        return reg_mats_dict
-
-    def reg_dicts_to_device(self, device):
-        for reg_type, reg_mat in self.reg_mats_dict.items():
-            self.reg_mats_dict[reg_type] = reg_mat.to(device)
-
-
-def _get_activation_fn(activation):
-    if activation == "relu":
-        return F.relu
-    elif activation == "softplus":
-        return F.softplus
-    else:
-        raise RuntimeError("activation should be relu/softplus, not {}".format(activation))

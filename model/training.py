@@ -13,9 +13,10 @@ from tensorboardX import SummaryWriter
 
 from .dataset import create_datasets
 from .optimizer import Lamb, log_lamb_rs, ScheduledOptim
+from .model_utils import save_model, compute_reg_loss, get_null_adj_nll
 
 import sys; sys.path.append('..')
-from utils.generic_utils import to_np, compute_reg_loss, get_null_adj_nll
+from utils.generic_utils import to_np
 
 
 class MTTrainer:
@@ -29,7 +30,7 @@ class MTTrainer:
         self.device = torch.device("cuda" if cuda_condition else "cpu")
 
         self.model = model.to(self.device)
-        self.model.reg_dicts_to_device(self.device)
+        self.model.extras_to_device(self.device)
         self.train_config = train_config
         self.config = model.config
 
@@ -69,11 +70,13 @@ class MTTrainer:
 
             if (epoch + 1) % self.train_config.chkpt_freq == 0:
                 print('Saving chkpt:{:d}'.format(epoch+1))
-                train_preds_dict, valid_preds_dict = self.evaluate_model()
-                self.model.save('chkpt:{:d}'.format(epoch+1), comment=comment)
+                # train_preds_dict, valid_preds_dict = self.evaluate_model()
+                save_model(
+                    self.model,
+                    prefix='chkpt:{:d}'.format(epoch+1),
+                    comment=comment)
 
-        return train_preds_dict, valid_preds_dict
-
+    # TODO: fix this to mode dependent train or valid
     def evaluate_model(self):
         train_preds_dict = self.generante_prediction(mode='train')
         valid_preds_dict = self.generante_prediction(mode='valid')
@@ -118,7 +121,10 @@ class MTTrainer:
                 batch_inputs = batch_data_tuple[0]
                 batch_targets = batch_data_tuple[1]
 
-                pred = self.model(batch_inputs)
+                if self.config.multicell:
+                    pred = self.model(batch_inputs, expt)
+                else:
+                    pred = self.model(batch_inputs)
                 loss = self.model.criterion(pred, batch_targets)
                 losses_dict.update({expt: loss})
                 cuml_loss += loss.item()
@@ -135,10 +141,16 @@ class MTTrainer:
                     else:
                         log_lamb_rs(self.optim, self.writer, global_step)
 
-            reg_tensors = {
-                'd2t': self.model.temporal_kernel.weight,
-                'd2x': self.model.spatial_kernel.weight,
-            }
+            if self.config.multicell:
+                reg_tensors = {
+                    'd2t': self.model.core.temporal_fc.weight,
+                    'd2x': self.model.core.rot_conv2d.weight,
+                }
+            else:
+                reg_tensors = {
+                    'd2t': self.model.temporal_kernel.weight,
+                    'd2x': self.model.spatial_kernel.weight,
+                }
             reg_losses_dict = compute_reg_loss(
                 reg_vals=self.train_config.regularization,
                 reg_mats=self.model.reg_mats_dict,
@@ -234,7 +246,7 @@ class MTTrainer:
 
     def swap_model(self, new_model):
         self.model = new_model.to(self.device)
-        self.model.reg_dicts_to_device(self.device)
+        self.model.extras_to_device(self.device)
 
     def setup_optim(self):
         if self.train_config.optim_choice == 'lamb':

@@ -14,13 +14,16 @@ class Config:
             initializer_range: float = 0.02,
             multicell: bool = True,
             nb_vel_tuning_units: List[int] = None,
-            activation_fn: str = 'softplus',
-            spatial_kernel_size: int = 7,
+            core_activation_fn: str = 'relu',
+            readout_activation_fn: str = 'softplus',
+            rot_kernel_size: int = 5,
+            nb_rot_kernels: int = 10,
+            nb_rotations: int = 8,
             temporal_kernel_size: int = 3,
-            nb_spatial_units: int = None,
             nb_temporal_units: int = None,
             nb_spatial_blocks: int = 3,
             dropout: float = 0.1,
+            layer_norm_eps=1e-12,
             base_dir: str = 'Documents/PROJECTS/MT_LFP',
             data_file: str = None,
     ):
@@ -37,25 +40,27 @@ class Config:
         self.initializer_range = initializer_range
 
         self.multicell = multicell
+
         # single cell configs
         if nb_vel_tuning_units is None:
             self.nb_vel_tuning_units = [10, 10, 10, 10, 10]
         else:
             self.nb_vel_tuning_units = nb_vel_tuning_units
+
         # multicell or shared configs
-        self.activation_fn = activation_fn
+        self.core_activation_fn = core_activation_fn
+        self.readout_activation_fn = readout_activation_fn
         self.nb_spatial_blocks = nb_spatial_blocks
-        self.spatial_kernel_size = spatial_kernel_size
+        self.rot_kernel_size = rot_kernel_size
+        self.nb_rot_kernels = nb_rot_kernels
+        self.nb_rotations = nb_rotations
         self.temporal_kernel_size = temporal_kernel_size
-        if nb_spatial_units is None:
-            self.nb_spatial_units = [10]
-        else:
-            self.nb_spatial_units = nb_spatial_units
         if nb_temporal_units is None:
             self.nb_temporal_units = [5, 5, 5]
         else:
             self.nb_temporal_units = nb_temporal_units
         self.dropout = dropout
+        self.layer_norm_eps = layer_norm_eps
 
         # dir configs
         self.base_dir = pjoin(os.environ['HOME'], base_dir)

@@ -22,9 +22,15 @@ def convert_time(time_in_secs):
 
 
 def plot_vel_field(data, fig_size=(14, 3), scale=None, save_file=None, estimate_center=True):
-    grd = data.shape[0]
+    if data.shape[-1] == 2:
+        grd = data.shape[0]
+        uu, vv = data[..., 0], data[..., 1]
+    elif data.shape[0] == 2:
+        grd = data.shape[-1]
+        uu, vv = data[0, ...], data[1, ...]
+    else:
+        raise NotImplementedError
     xx, yy = np.mgrid[0:grd, 0:grd]
-    uu, vv = data[..., 0], data[..., 1]
     cc = np.sqrt(np.square(uu) + np.square(vv))
 
     plt.figure(figsize=fig_size)

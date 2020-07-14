@@ -140,7 +140,9 @@ def get_null_adj_nll(true, pred):
 def get_activation_fn(activation):
     if activation == "relu":
         return F.relu
+    if activation == "leaky_relu":
+        return F.leaky_relu
     elif activation == "softplus":
         return F.softplus
     else:
-        raise RuntimeError("activation should be relu/softplus, not {}".format(activation))
+        raise RuntimeError("activation should be relu/leaky_relu/softplus, not {}".format(activation))

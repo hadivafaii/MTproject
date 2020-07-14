@@ -16,7 +16,7 @@ from .optimizer import Lamb, log_lamb_rs, ScheduledOptim
 from .model_utils import save_model, compute_reg_loss, get_null_adj_nll
 
 import sys; sys.path.append('..')
-from utils.generic_utils import to_np
+from utils.generic_utils import to_np, plot_vel_field
 
 
 class MTTrainer:
@@ -59,11 +59,11 @@ class MTTrainer:
             comment += 'lr:{:.1e}'.format(self.train_config.batch_size)
 
         self.writer = SummaryWriter(
-            pjoin(self.train_config.runs_dir, "{}_{}".format(comment, datetime.now().strftime("[%Y_%m_%d_%H:%M]"))))
+            pjoin(self.train_config.runs_dir, "{}_{}".format(
+                comment, datetime.now().strftime("[%Y_%m_%d_%H:%M]"))))
 
         self.model.train()
 
-        train_preds_dict, valid_preds_dict = {}, {}
         epochs_range = range(nb_epochs) if isinstance(nb_epochs, int) else nb_epochs
         for epoch in epochs_range:
             self.iteration(self.train_loaders_dict, epoch=epoch)
@@ -76,7 +76,7 @@ class MTTrainer:
                     prefix='chkpt:{:d}'.format(epoch+1),
                     comment=comment)
 
-    # TODO: fix this to mode dependent train or valid
+    # TODO: fix this to multicell vs single cell presentation
     def evaluate_model(self):
         train_preds_dict = self.generante_prediction(mode='train')
         valid_preds_dict = self.generante_prediction(mode='valid')
@@ -100,6 +100,7 @@ class MTTrainer:
         return train_preds_dict, valid_preds_dict
 
     def iteration(self, dataloaders_dict, epoch=0):
+        # TODO: make cum loss expt dependet and print the cum loss for each extp, as well has mean cum loss (over all expts)
         cuml_loss = 0.0
         cuml_reg_loss = 0.0
 
@@ -121,11 +122,26 @@ class MTTrainer:
                 batch_inputs = batch_data_tuple[0]
                 batch_targets = batch_data_tuple[1]
 
+                if torch.isnan(batch_inputs).sum().item():
+                    print(i, expt, batch_inputs.size(), torch.isnan(batch_inputs).sum())
+
                 if self.config.multicell:
                     pred = self.model(batch_inputs, expt)
                 else:
                     pred = self.model(batch_inputs)
                 loss = self.model.criterion(pred, batch_targets)
+
+                if torch.isnan(loss).sum() > 0:
+                    print(loss.item())
+                    print(pred.size())
+                    print(pred)
+                    hahaha = torch.where(torch.isnan(pred) == 1)[0]
+                    print('hahaha', len(hahaha))
+                    for j in range(40):
+                        plot_vel_field(np.transpose(to_np(batch_inputs[hahaha[0], j]), (1, 2, 0)), estimate_center=False)
+                    print(batch_inputs[hahaha])
+                    break
+
                 losses_dict.update({expt: loss})
                 cuml_loss += loss.item()
 
@@ -151,6 +167,7 @@ class MTTrainer:
                     'd2t': self.model.temporal_kernel.weight,
                     'd2x': self.model.spatial_kernel.weight,
                 }
+
             reg_losses_dict = compute_reg_loss(
                 reg_vals=self.train_config.regularization,
                 reg_mats=self.model.reg_mats_dict,
@@ -171,6 +188,13 @@ class MTTrainer:
             if self.train_config.optim_choice == 'adam_with_warmup':
                 self.optim_schedule.zero_grad()
                 final_loss.backward()
+               # try:
+               #     print(self.model.vel_tuning[0].weight.grad.squeeze())
+               #     print(self.model.vel_tuning[2].weight.grad.squeeze())
+               # except AttributeError:
+               #     print('what!')
+              #  print(self.model.vel_tuning[4].weight.grad.squeeze())
+              #  print(self.model.temporal_kernel.weight.grad.squeeze())
                 self.optim_schedule.step_and_update_lr()
             else:
                 self.optim.zero_grad()
@@ -213,7 +237,10 @@ class MTTrainer:
 
                 for i, data_tuple in enumerate(loader):
                     with torch.no_grad():
-                        pred = self.model(data_tuple[0].to(self.device, dtype=torch.float))
+                        if self.config.multicell:
+                            pred = self.model(data_tuple[0].to(self.device, dtype=torch.float), expt)
+                        else:
+                            pred = self.model(data_tuple[0].to(self.device, dtype=torch.float))
 
                     true_list.append(data_tuple[1])
                     pred_list.append(pred)
@@ -230,7 +257,10 @@ class MTTrainer:
 
                 for i, data_tuple in enumerate(loader):
                     with torch.no_grad():
-                        pred = self.model(data_tuple[0].to(self.device, dtype=torch.float))
+                        if self.config.multicell:
+                            pred = self.model(data_tuple[0].to(self.device, dtype=torch.float), expt)
+                        else:
+                            pred = self.model(data_tuple[0].to(self.device, dtype=torch.float))
 
                     true_list.append(data_tuple[1])
                     pred_list.append(pred)
@@ -267,6 +297,11 @@ class MTTrainer:
             )
 
         elif self.train_config.optim_choice == 'adam_with_warmup':
+            if self.config.multicell:
+                hidden_size = self.model.core.output_size
+            else:
+                hidden_size = self.model.config.grid_size ** 2
+
             self.optim = Adam(
                 filter(lambda p: p.requires_grad, self.model.parameters()),
                 betas=self.train_config.betas,
@@ -296,13 +331,17 @@ class MTTrainer:
                 dataset=dataset,
                 sampler=SubsetRandomSampler(trn_indices),
                 batch_size=self.train_config.batch_size,
+                # num_workers=1,
                 pin_memory=True,
+                drop_last=True,
             )
             valid_loader = DataLoader(
                 dataset=dataset,
                 sampler=SubsetRandomSampler(val_indices),
                 batch_size=self.train_config.batch_size,
+                # num_workers=1,
                 pin_memory=True,
+                drop_last=True,
             )
 
             self.train_valid_indxs.update({expt: (trn_indices, val_indices)})

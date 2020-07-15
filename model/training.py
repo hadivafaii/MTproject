@@ -157,59 +157,50 @@ class MTTrainer:
                     else:
                         log_lamb_rs(self.optim, self.writer, global_step)
 
+            msg0 = 'epoch {:d}'.format(epoch)
+            msg1 = ""
+            for k, v in losses_dict.items():
+                msg1 += "{}: {:.3f}, ".format(k, v.item())
+
             if self.config.multicell:
-                reg_tensors = {
-                    'd2t': self.model.core.temporal_fc.weight,
-                    'd2x': self.model.core.rot_conv2d.weight,
-                }
+                final_loss = sum(x for x in losses_dict.values()) / len(losses_dict)
+                msg1 += "tot: {:.3f}, ".format(final_loss.item())
+
             else:
                 reg_tensors = {
                     'd2t': self.model.temporal_kernel.weight,
                     'd2x': self.model.spatial_kernel.weight,
                 }
+                reg_losses_dict = compute_reg_loss(
+                    reg_vals=self.train_config.regularization,
+                    reg_mats=self.model.reg_mats_dict,
+                    tensors=reg_tensors)
 
-            reg_losses_dict = compute_reg_loss(
-                reg_vals=self.train_config.regularization,
-                reg_mats=self.model.reg_mats_dict,
-                tensors=reg_tensors)
+                global_step = epoch * max_num_batches + i
+                if (global_step + 1) % self.train_config.log_freq == 0:
+                    for k, v in reg_losses_dict.items():
+                        self.writer.add_scalar("reg_loss/{}".format(k), v.item(), global_step)
 
-            global_step = epoch * max_num_batches + i
-            if (global_step + 1) % self.train_config.log_freq == 0:
-                for k, v in reg_losses_dict.items():
-                    self.writer.add_scalar("reg_loss/{}".format(k), v.item(), global_step)
+                total_reg_loss = sum(x for x in reg_losses_dict.values()) / len(reg_losses_dict)
+                cuml_reg_loss += total_reg_loss.item()
 
-            total_loss = sum(x for x in losses_dict.values()) / len(losses_dict)
-            total_reg_loss = sum(x for x in reg_losses_dict.values()) / len(reg_losses_dict)
-            cuml_reg_loss += total_reg_loss.item()
+                total_loss = sum(x for x in losses_dict.values()) / len(losses_dict)
+                final_loss = total_loss + total_reg_loss
 
-            final_loss = total_loss + total_reg_loss
+                msg1 += "tot reg: {:.2e}".format(total_reg_loss.item())
+
+            desc1 = msg0 + '\t|\t' + msg1
+            pbar.set_description(desc1)
 
             # backward and optimization only in train
             if self.train_config.optim_choice == 'adam_with_warmup':
                 self.optim_schedule.zero_grad()
                 final_loss.backward()
-               # try:
-               #     print(self.model.vel_tuning[0].weight.grad.squeeze())
-               #     print(self.model.vel_tuning[2].weight.grad.squeeze())
-               # except AttributeError:
-               #     print('what!')
-              #  print(self.model.vel_tuning[4].weight.grad.squeeze())
-              #  print(self.model.temporal_kernel.weight.grad.squeeze())
                 self.optim_schedule.step_and_update_lr()
             else:
                 self.optim.zero_grad()
                 final_loss.backward()
                 self.optim.step()
-
-            msg0 = 'epoch {:d}'.format(epoch)
-            msg1 = ""
-            for k, v in losses_dict.items():
-                msg1 += "{}: {:.3f}, ".format(k, v.item())
-            msg1 += "tot: {:.3f}, ".format(total_loss.item())
-            msg1 += "tot reg: {:.2e}".format(total_reg_loss.item())
-
-            desc1 = msg0 + '\t|\t' + msg1
-            pbar.set_description(desc1)
 
             global_step = epoch * max_num_batches + i
             if i + 1 == max_num_batches:
@@ -219,6 +210,7 @@ class MTTrainer:
                     cuml_loss / max_num_batches / len(dataloaders_dict),
                     cuml_reg_loss / max_num_batches / len(self.train_config.regularization))
                 pbar.set_description(desc2)
+            # TODO: add cum loss for all experiments, so it gets printed at the end of epoch
 
                 # self.writer.add_embedding(
                 #   self.model.get_word_embeddings(self.device),
@@ -297,11 +289,6 @@ class MTTrainer:
             )
 
         elif self.train_config.optim_choice == 'adam_with_warmup':
-            if self.config.multicell:
-                hidden_size = self.model.core.output_size
-            else:
-                hidden_size = self.model.config.grid_size ** 2
-
             self.optim = Adam(
                 filter(lambda p: p.requires_grad, self.model.parameters()),
                 betas=self.train_config.betas,
@@ -309,12 +296,9 @@ class MTTrainer:
             )
             self.optim_schedule = ScheduledOptim(
                 optimizer=self.optim,
-                hidden_size=self.model.config.grid_size ** 2,
+                hidden_size=512,
                 n_warmup_steps=self.train_config.warmup_steps,
             )
-
-            # print('\nUsing {} with {} warmup steps.  Large vs small lr doesnt apply. . . '.format(
-            #     self.train_config.optim_choice, self.train_config.warmup_steps))
 
         else:
             raise ValueError("Invalid optimizer choice: {}".format(self.train_config.optim_chioce))
@@ -331,7 +315,6 @@ class MTTrainer:
                 dataset=dataset,
                 sampler=SubsetRandomSampler(trn_indices),
                 batch_size=self.train_config.batch_size,
-                # num_workers=1,
                 pin_memory=True,
                 drop_last=True,
             )
@@ -339,7 +322,6 @@ class MTTrainer:
                 dataset=dataset,
                 sampler=SubsetRandomSampler(val_indices),
                 batch_size=self.train_config.batch_size,
-                # num_workers=1,
                 pin_memory=True,
                 drop_last=True,
             )

@@ -16,12 +16,14 @@ class Config:
             nb_vel_tuning_units: List[int] = None,
             core_activation_fn: str = 'leaky_relu',
             readout_activation_fn: str = 'softplus',
-            rot_kernel_size: int = 7,
-            nb_rot_kernels: int = 5,
+            spatial_kernel_size: int = 3,
+            nb_rot_kernels: int = 20,
             nb_rotations: int = 8,
+            nb_spatial_readouts: int = 100,
+            nb_temporal_kernels: int = 3,
             temporal_kernel_size: int = 3,
             nb_temporal_units: int = None,
-            nb_spatial_blocks: int = 3,
+            # nb_spatial_blocks: int = 3,
             dropout: float = 0.1,
             layer_norm_eps=1e-12,
             base_dir: str = 'Documents/PROJECTS/MT_LFP',
@@ -50,13 +52,15 @@ class Config:
         # multicell or shared configs
         self.core_activation_fn = core_activation_fn
         self.readout_activation_fn = readout_activation_fn
-        self.nb_spatial_blocks = nb_spatial_blocks
-        self.rot_kernel_size = rot_kernel_size
+        # self.nb_spatial_blocks = nb_spatial_blocks
+        self.spatial_kernel_size = spatial_kernel_size
         self.nb_rot_kernels = nb_rot_kernels
         self.nb_rotations = nb_rotations
+        self.nb_spatial_readouts = nb_spatial_readouts
+        self.nb_temporal_kernels = nb_temporal_kernels
         self.temporal_kernel_size = temporal_kernel_size
         if nb_temporal_units is None:
-            self.nb_temporal_units = [5, 5, 5]
+            self.nb_temporal_units = [10, 10, 10]
         else:
             self.nb_temporal_units = nb_temporal_units
         self.dropout = dropout

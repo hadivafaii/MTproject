@@ -54,7 +54,6 @@ class MTNet(nn.Module):
         for reg_type, reg_mat in self.reg_mats_dict.items():
             self.reg_mats_dict[reg_type] = reg_mat.to(device)
         self.core.rot_conv2d.rot_mat_to_device(device)
-      #  self.readout.spatial_readout_to_device(device)
 
 
 class MTReadout(nn.Module):
@@ -67,59 +66,24 @@ class MTReadout(nn.Module):
         load_dir = pjoin(config.base_dir, 'extra_info')
         self.nb_cells_dict = np.load(pjoin(load_dir, "nb_cells_dict.npy"), allow_pickle=True).item()
         self.ctrs_dict = np.load(pjoin(load_dir, "ctrs_dict.npy"), allow_pickle=True).item()
-        # self.spatial_readout = self._create_spatial_readout()
 
         self.norm = nn.LayerNorm(hidden_size, config.layer_norm_eps)
-        # self.spatial = weight_norm(nn.Linear(config.grid_size ** 2, num_spatial_filters, bias=False))
 
         layers = {}
-        # spatial_readouts = {}
         for expt, nb_cells in self.nb_cells_dict.items():
             layers.update({expt: nn.Linear(hidden_size, nb_cells, bias=True)})
-            # spatial_readouts.update({expt: nn.Linear(config.grid_size ** 2, nb_cells, bias=False)})
         self.layers = nn.ModuleDict(layers)
-        # self.spatial_readouts = nn.ModuleDict(spatial_readouts)
 
         self.activation = get_activation_fn(config.readout_activation_fn)
         print_num_params(self)
 
     def forward(self, x, experiment_name: str):
         # inout is N x hidden_size
-        # x = x.flatten(start_dim=2)  # N x hidden_size x grd ** 2
-        # x = self.spatial(x).flatten(start_dim=1)    # N x hidden_size * num_spatial_filters
-        # x = self.spatial_readouts[experiment_name](x)
-        # TODO: fix this for multiple cells
-        # x = x.squeeze()  # TODO: since clu053 has single cell, this will work for now
         x = self.norm(x)
         y = self.layers[experiment_name](x)
         y = self.activation(y)
 
         return y
-
-    # def spatial_readout_to_device(self, device):
-    #    self.spatial_readout = self.spatial_readout.to(device)
-
-    # def init_spatial_readouts(self):
-        # for expt, nb_cells in self.nb_cells_dict.items():
-            # spatial_readout = np.zeros((nb_cells, self.config.grid_size ** 2))
-            # for cell in range(nb_cells):
-                # ctr_x, ctr_y = self.ctrs_dict[expt][cell]
-                # spatial_readout[cell, ctr_y * self.config.grid_size + ctr_x] = 1
-            # assert self.spatial_readouts[expt].weight.data.size() == spatial_readout.shape
-            # self.spatial_readouts[expt].weight.data = torch.tensor(spatial_readout, dtype=torch.float32)
-
-    def _create_spatial_readout(self):
-        ctr_x = 5
-        ctr_y = 9
-
-        nb_cells = 1
-
-        spatial_readout = np.zeros((self.config.grid_size ** 2, nb_cells))
-
-        for cell in range(nb_cells):
-            spatial_readout[ctr_y * self.config.grid_size + ctr_x, cell] = 1
-
-        return torch.tensor(spatial_readout, dtype=torch.float32)
 
 
 class MTRotatioanlConvCore(nn.Module):
@@ -128,10 +92,8 @@ class MTRotatioanlConvCore(nn.Module):
 
         self.config = config
 
-        # self.tcn = TemporalConvNet(num_inputs=1, config=config)
         self.temporal_fc = nn.Linear(config.time_lags, config.nb_temporal_kernels, bias=False)
         self.spatial_fc = weight_norm(nn.Linear(config.grid_size ** 2, config.nb_spatial_readouts, bias=False))
-        # self.nb_temporal_channels = config.nb_temporal_units[-1]
         self.nb_spatial_conv_channels = config.nb_rotations * config.nb_rot_kernels * config.nb_temporal_kernels
         self.nb_conv_layers = int(np.floor(np.log2(config.grid_size)))
         self.chomp = Chomp(chomp_size=config.spatial_kernel_size - 1, nb_dims=2)
@@ -182,10 +144,6 @@ class MTRotatioanlConvCore(nn.Module):
             outputs += (x,)
             outputs_main += (x1,)
 
-        # x1 = self.chomp(self.conv1(x0_pool))
-        # res1 = x0_pool if self.downsample1 is None else self.downsample1(x0_pool)
-        # x1 = self.activation(x1 + res1)
-        # x1_pool = self.pool1(x1)
         return torch.cat(outputs_main, dim=-1)
 
     def _rot_st_fwd(self, x):
@@ -263,15 +221,6 @@ class RotConv2d(nn.Conv2d):
         return w
 
 
-# TODO
-class SpatialBlock(nn.Module):
-    pass
-
-
-class SpatialConvNet(nn.Module):
-    pass
-
-
 class TemporalBlock(nn.Module):
     def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.1):
         super(TemporalBlock, self).__init__()
@@ -293,13 +242,6 @@ class TemporalBlock(nn.Module):
                                  self.conv2, self.chomp2, self.relu2, self.dropout2)
         self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
         self.relu = nn.ReLU()
-        # self.init_weights()
-
-    #  def init_weights(self):
-    #    self.conv1.weight.data.normal_(0, 0.02)
-    #    self.conv2.weight.data.normal_(0, 0.02)
-    #    if self.downsample is not None:
-    #        self.downsample.weight.data.normal_(0, 0.02)
 
     def forward(self, x):
         out = self.net(x)
@@ -374,15 +316,15 @@ class MTLayer(nn.Module):
         print_num_params(self)
 
     def forward(self, x):
-        x = x.permute(0, 1, 3, 4, 2)   # N x tau x grd x grd x 2
+        x = x.permute(0, 4, 2, 3, 1)  # N x tau x grd x grd x 2
         rho = torch.norm(x, dim=-1)
 
         # angular component
         f_theta = torch.exp(self.dir_tuning(x).squeeze(-1) / rho.masked_fill(rho == 0., 1e-8))
 
         # radial component
-        original_shape = rho.size()
-        rho = rho.flatten(end_dim=1).unsqueeze(1)   # N*tau x 1 x H x W
+        original_shape = rho.size()  # N x tau x grd x grd
+        rho = rho.flatten(end_dim=1).unsqueeze(1)  # N*tau x 1 x grd x grd
         f_r = self.vel_tuning(rho)
         f_r = f_r.squeeze(1).view(original_shape)
 
@@ -391,8 +333,8 @@ class MTLayer(nn.Module):
         subunit = subunit.flatten(start_dim=2)  # N x tau x H*W
 
         # apply spatial and temporal kernels
-        y = self.temporal_kernel(subunit.permute(0, 2, 1)).squeeze(-1)
-        y = self.spatial_kernel(y)
+        y = self.spatial_kernel(subunit).squeeze()  # N x tau
+        y = self.temporal_kernel(y)  # N x 1
         y = self.activation(y)
 
         return y

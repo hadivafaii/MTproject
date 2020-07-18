@@ -4,6 +4,7 @@ from tqdm import tqdm
 from os.path import join as pjoin
 from datetime import datetime
 from sklearn.metrics import r2_score
+from prettytable import PrettyTable
 
 import torch
 from torch.optim import Adam
@@ -11,7 +12,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 from tensorboardX import SummaryWriter
 
-from .dataset import create_datasets
+from .dataset import create_datasets, generate_xv_folds
 from .optimizer import Lamb, log_lamb_rs, ScheduledOptim
 from .model_utils import save_model, compute_reg_loss, get_null_adj_nll
 
@@ -76,29 +77,6 @@ class MTTrainer:
                     prefix='chkpt:{:d}'.format(epoch+1),
                     comment=comment)
 
-    # TODO: fix this to multicell vs single cell presentation
-    def evaluate_model(self):
-        train_preds_dict = self.generante_prediction(mode='train')
-        valid_preds_dict = self.generante_prediction(mode='valid')
-
-        nnll_all = []
-        r2_all = []
-        for expt, (true, pred) in train_preds_dict.items():
-            nnll_all.append(get_null_adj_nll(true, pred))
-            r2_all.append(r2_score(true, pred, multioutput='raw_values') * 100)
-
-        print('avg train nnll: {:.3f}, r2: {:.2f} {}'.format(np.mean(nnll_all), np.mean(r2_all), '%'))
-
-        nnll_all = []
-        r2_all = []
-        for expt, (true, pred) in valid_preds_dict.items():
-            nnll_all.append(get_null_adj_nll(true, pred))
-            r2_all.append(r2_score(true, pred, multioutput='raw_values') * 100)
-
-        print('avg valid nnll: {:.3f}, r2: {:.2f} {}'.format(np.mean(nnll_all), np.mean(r2_all), '%'))
-
-        return train_preds_dict, valid_preds_dict
-
     def iteration(self, dataloaders_dict, epoch=0):
         # TODO: make cum loss expt dependet and print the cum loss for each extp, as well has mean cum loss (over all expts)
         cuml_loss = 0.0
@@ -123,7 +101,11 @@ class MTTrainer:
                 batch_targets = batch_data_tuple[1]
 
                 if torch.isnan(batch_inputs).sum().item():
-                    print(i, expt, batch_inputs.size(), torch.isnan(batch_inputs).sum())
+                    print("expt = {}. i = {}. nan encountered in inputs. moving on".format(expt, i))
+                    continue
+                elif torch.isnan(batch_targets).sum().item():
+                    print("expt = {}. i = {}. nan encountered in targets. moving on".format(expt, i))
+                    continue
 
                 if self.config.multicell:
                     pred = self.model(batch_inputs, expt)
@@ -131,16 +113,9 @@ class MTTrainer:
                     pred = self.model(batch_inputs)
                 loss = self.model.criterion(pred, batch_targets)
 
-                if torch.isnan(loss).sum() > 0:
-                    print(loss.item())
-                    print(pred.size())
-                    print(pred)
-                    hahaha = torch.where(torch.isnan(pred) == 1)[0]
-                    print('hahaha', len(hahaha))
-                    for j in range(40):
-                        plot_vel_field(np.transpose(to_np(batch_inputs[hahaha[0], j]), (1, 2, 0)), estimate_center=False)
-                    print(batch_inputs[hahaha])
-                    break
+                if torch.isnan(loss).sum().item():
+                    print("expt = {}. i = {}. nan encountered in loss. moving on".format(expt, i))
+                    continue
 
                 losses_dict.update({expt: loss})
                 cuml_loss += loss.item()
@@ -266,6 +241,47 @@ class MTTrainer:
 
         return preds_dict
 
+    def evaluate_model(self):
+        train_preds_dict = self.generante_prediction(mode='train')
+        valid_preds_dict = self.generante_prediction(mode='valid')
+
+        train_nnll, valid_nnll = {}, {}
+        train_r2, valid_r2 = {}, {}
+
+        for expt, (true, pred) in train_preds_dict.items():
+            train_nnll.update({expt: get_null_adj_nll(true, pred)})
+            train_r2.update({expt: r2_score(true, pred, multioutput='raw_values') * 100})
+
+        for expt, (true, pred) in valid_preds_dict.items():
+            valid_nnll.update({expt: get_null_adj_nll(true, pred)})
+            valid_r2.update({expt: r2_score(true, pred, multioutput='raw_values') * 100})
+
+        t = PrettyTable(['Experiment Name', 'Channel', 'Train NNLL', 'Valid NNLL', 'Train R^2', 'Valid R^2'])
+
+        for expt in self.config.experiment_names:
+            for cell in range(self.model.readout.nb_cells_dict[expt]):
+                t.add_row([
+                    expt, cell,
+                    np.round(train_nnll[expt][cell], 3),
+                    np.round(valid_nnll[expt][cell], 3),
+                    "{} {}".format(np.round(train_r2[expt][cell], 1), "%"),
+                    "{} {}".format(np.round(valid_r2[expt][cell], 1), "%"),
+                ])
+
+        print(t)
+        print('avg valid nnll: {:.3f}, r2: {:.1f} {} \n\n'.format(
+            np.mean([np.mean(item) for item in valid_nnll.values()]),
+            np.mean([np.mean(item) for item in valid_r2.values()]), '%'))
+
+        output = {
+            "train_preds_dict": train_preds_dict,
+            "valid_preds_dict": valid_preds_dict,
+            "train_nnll": train_nnll, "valid_nnll": valid_nnll,
+            "train_r2": train_r2, "valid_r2": valid_r2,
+        }
+
+        return output
+
     def swap_model(self, new_model):
         self.model = new_model.to(self.device)
         self.model.extras_to_device(self.device)
@@ -305,31 +321,29 @@ class MTTrainer:
 
     def _create_train_valid_loaders(self):
         for expt, dataset in self.datasets_dict.items():
-            dataset_size = len(dataset)
-            indices = list(range(dataset_size))
-            self.rng.shuffle(indices)
-            split = int(np.floor(self.train_config.validation_split * dataset_size))
+            train_inds, valid_inds = generate_xv_folds(len(dataset), num_folds=self.train_config.xv_folds)
+            self.rng.shuffle(train_inds)
+            self.rng.shuffle(valid_inds)
 
-            trn_indices, val_indices = indices[split:], indices[:split]
             train_loader = DataLoader(
                 dataset=dataset,
-                sampler=SubsetRandomSampler(trn_indices),
+                sampler=SubsetRandomSampler(train_inds),
                 batch_size=self.train_config.batch_size,
-                pin_memory=True,
+                # pin_memory=True,
                 drop_last=True,
             )
             valid_loader = DataLoader(
                 dataset=dataset,
-                sampler=SubsetRandomSampler(val_indices),
+                sampler=SubsetRandomSampler(valid_inds),
                 batch_size=self.train_config.batch_size,
-                pin_memory=True,
+                # pin_memory=True,
                 drop_last=True,
             )
 
-            self.train_valid_indxs.update({expt: (trn_indices, val_indices)})
+            self.train_valid_indxs.update({expt: (train_inds, valid_inds)})
             self.train_loaders_dict.update({expt: train_loader})
             self.valid_loaders_dict.update({expt: valid_loader})
 
 
 def _send_to_cuda(data_tuple, device, dtype=torch.float32):
-    return tuple(map(lambda z: z.to(device=device, dtype=dtype, non_blocking=True), data_tuple))
+    return tuple(map(lambda z: z.to(device=device, dtype=dtype, non_blocking=False), data_tuple))

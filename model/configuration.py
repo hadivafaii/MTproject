@@ -87,7 +87,7 @@ class TrainConfig:
             log_freq: int = 10,
             chkpt_freq: int = 10,
             batch_size: int = 1024,
-            validation_split: float = 0.2,
+            xv_folds: int = 5,
             freeze_parameters_keywords: list = None,
             runs_dir: str = 'Documents/MT/runs',
     ):
@@ -112,6 +112,6 @@ class TrainConfig:
         self.log_freq = log_freq
         self.chkpt_freq = chkpt_freq
         self.batch_size = batch_size
-        self.validation_split = validation_split
+        self.xv_folds = xv_folds
         self.freeze_parameters_keywords = freeze_parameters_keywords
         self.runs_dir = pjoin(os.environ['HOME'], runs_dir)

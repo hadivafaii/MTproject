@@ -52,6 +52,42 @@ def create_datasets(config):
     return dataset_dicts
 
 
+def generate_xv_folds(nt, num_folds=5, num_blocks=3, which_fold=None):
+    """Will generate unique and cross-validation indices, but subsample in each block
+        NT = number of time steps
+        num_folds = fraction of data (1/fold) to set aside for cross-validation
+        which_fold = which fraction of data to set aside for cross-validation (default: middle of each block)
+        num_blocks = how many blocks to sample fold validation from"""
+
+    valid_inds = []
+    nt_blocks = np.floor(nt / num_blocks).astype(int)
+    block_sizes = np.zeros(num_blocks, dtype=int)
+    block_sizes[range(num_blocks - 1)] = nt_blocks
+    block_sizes[num_blocks - 1] = nt - (num_blocks - 1) * nt_blocks
+
+    if which_fold is None:
+        which_fold = num_folds // 2
+    else:
+        assert which_fold < num_folds, 'Must choose XV fold within num_folds = {}'.format(num_folds)
+
+    # Pick XV indices for each block
+    cnt = 0
+    for bb in range(num_blocks):
+        start = np.floor(block_sizes[bb] * (which_fold / num_folds))
+        if which_fold < num_folds - 1:
+            stop = np.floor(block_sizes[bb] * ((which_fold + 1) / num_folds))
+        else:
+            stop = block_sizes[bb]
+
+        valid_inds = valid_inds + list(range(int(cnt + start), int(cnt + stop)))
+        cnt = cnt + block_sizes[bb]
+
+    valid_inds = np.array(valid_inds, dtype='int')
+    train_inds = np.setdiff1d(np.arange(0, nt, 1), valid_inds)
+
+    return list(train_inds), list(valid_inds)
+
+
 def _load_data(config):
     data_dict = {}
 

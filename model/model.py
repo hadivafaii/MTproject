@@ -64,11 +64,19 @@ class MTReadout(nn.Module):
         self.hidden_size = hidden_size
 
         load_dir = pjoin(config.base_dir, 'extra_info')
-        self.nb_cells_dict = np.load(pjoin(load_dir, "nb_cells_dict.npy"), allow_pickle=True).item()
-        self.ctrs_dict = np.load(pjoin(load_dir, "ctrs_dict.npy"), allow_pickle=True).item()
+        nb_cells_dict = np.load(pjoin(load_dir, "nb_cells_dict.npy"), allow_pickle=True).item()
+        ctrs_dict = np.load(pjoin(load_dir, "ctrs_dict.npy"), allow_pickle=True).item()
+        if config.experiment_names is not None:
+            self.nb_cells_dict = {expt: nb_cells_dict[expt] for expt in config.experiment_names}
+            self.ctrs_dict = {expt: ctrs_dict[expt] for expt in config.experiment_names}
+        else:
+            self.nb_cells_dict = nb_cells_dict
+            self.ctrs_dict = ctrs_dict
 
         self.norm = nn.LayerNorm(hidden_size, config.layer_norm_eps)
 
+        # TODO: idea, you can replace a linear layer with FF and some dim reduction:
+        #  hidden_dim -> readout_dim (e.g. 80)
         layers = {}
         for expt, nb_cells in self.nb_cells_dict.items():
             layers.update({expt: nn.Linear(hidden_size, nb_cells, bias=True)})

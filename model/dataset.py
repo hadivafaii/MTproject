@@ -12,44 +12,88 @@ sns.set_style('dark')
 
 
 class MTDataset(Dataset):
-    def __init__(self, config, experiment_name, data_dict, normalize=True):
+    def __init__(self, data_dict, time_lage, transform=None):
 
-        self.time_lags = config.time_lags
-        self.experiment_name = experiment_name
         self.data_dict = data_dict
-        self.normalize = normalize
+        self.time_lags = time_lage
+        self.transform = transform
+        self.lengths = {expt: len(data['indxs']) for (expt, data) in self.data_dict.items()}
 
     def __len__(self):
-        return len(self.data_dict['good_indxs'])
+        return max(list(self.lengths.values()))
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
-        i = self.data_dict['good_indxs'][idx]
-        source = self.data_dict['stim'][..., i - self.time_lags: i]
-        target = self.data_dict['spks'][i]
+        source = {
+            expt: data['stim'][..., data['indxs'][idx % self.lengths[expt]] - self.time_lags: data['indxs'][idx % self.lengths[expt]]] for
+            (expt, data) in self.data_dict.items()}
+        target = {
+            expt: data['spks'][data['indxs'][idx % self.lengths[expt]]] for
+            (expt, data) in self.data_dict.items()}
 
-        # TODO: predictive model should have entirely different dateset structure
-
-        if self.normalize:
-            source /= source.std()
+        if self.transform is not None:
+            source = self.transform(source)
 
         return source, target
 
 
-def create_datasets(config):
-    data_dict_all = _load_data(config)
-    if config.multicell:
-        normalize = True
+def normalize_fn(x):
+    if isinstance(x, dict):
+        return {k: v / v.std() for (k, v) in x.items()}
     else:
-        normalize = False
+        return x / x.std()
 
-    dataset_dicts = {}
+
+def create_datasets(config, xv_folds, rng):
+    data_dict_all = _load_data(config)
+    train_data_all = {}
+    valid_data_all = {}
     for expt, data_dict in data_dict_all.items():
-        dataset_dicts.update({expt: MTDataset(config, expt, data_dict, normalize)})
+        nt = len(data_dict['good_indxs'])
+        train_inds, valid_inds = generate_xv_folds(nt, num_folds=xv_folds)
+        rng.shuffle(train_inds)
+        rng.shuffle(valid_inds)
 
-    return dataset_dicts
+        #train_stim = []
+        #train_spks = []
+        #for idx in data_dict['good_indxs'][train_inds]:
+        #    train_stim.append(np.expand_dims(data_dict['stim'][..., idx - config.time_lags: idx], axis=0))
+        #    train_spks.append(np.expand_dims(data_dict['spks'][idx], axis=0))
+        #train_stim = np.concatenate(train_stim)
+        #train_spks = np.concatenate(train_spks)
+
+        #valid_stim = []
+        #valid_spks = []
+        #for idx in data_dict['good_indxs'][valid_inds]:
+        #    valid_stim.append(np.expand_dims(data_dict['stim'][..., idx - config.time_lags: idx], axis=0))
+        #    valid_spks.append(np.expand_dims(data_dict['spks'][idx], axis=0))
+        #valid_stim = np.concatenate(valid_stim)
+        #valid_spks = np.concatenate(valid_spks)
+
+        train_data = {
+            'stim': data_dict['stim'],
+            'spks': data_dict['spks'],
+            'indxs': data_dict['good_indxs'][train_inds],
+        }
+        valid_data = {
+            'stim': data_dict['stim'],
+            'spks': data_dict['spks'],
+            'indxs': data_dict['good_indxs'][valid_inds],
+        }
+
+        train_data_all.update({expt: train_data})
+        valid_data_all.update({expt: valid_data})
+
+    if config.multicell:
+        train_dataset = MTDataset(train_data_all, config.time_lags, normalize_fn)
+        valid_dataset = MTDataset(valid_data_all, config.time_lags, normalize_fn)
+    else:
+        train_dataset = MTDataset(train_data_all, config.time_lags)
+        valid_dataset = MTDataset(valid_data_all, config.time_lags)
+
+    return train_dataset, valid_dataset, list(data_dict_all.keys())
 
 
 def generate_xv_folds(nt, num_folds=5, num_blocks=3, which_fold=None):

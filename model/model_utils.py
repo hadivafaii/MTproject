@@ -39,7 +39,7 @@ def load_model(model_id=-1, chkpt_id=-1, config=None, load_dir=None, verbose=Tru
     from .model import MTLayer, MTNet
 
     if load_dir is None:
-        _dir = pjoin(os.environ['HOME'], 'Documents/PROJECTS/MT_LFP/saved_models')
+        _dir = pjoin(os.environ['HOME'], 'Documents/MT/MT_LFP',  'saved_models')
         available_models = os.listdir(_dir)
         if verbose:
             print('Available models to load:\n', available_models)
@@ -66,7 +66,11 @@ def load_model(model_id=-1, chkpt_id=-1, config=None, load_dir=None, verbose=Tru
         loaded_model = MTLayer(config)
     loaded_model.load_state_dict(torch.load(pjoin(load_dir, 'model.bin')))
 
-    return loaded_model
+    chkpt = load_dir.split("/")[-1].split("_")[0]
+    model_name = load_dir.split("/")[-2]
+    metadata = {"chkpt": chkpt, "model_name": model_name}
+
+    return loaded_model, metadata
 
 
 def print_num_params(module: nn.Module):

@@ -25,6 +25,7 @@ class MTTrainer:
         os.environ["SEED"] = str(seed)
         torch.manual_seed(seed)
         np.random.seed(seed)
+        self.seed = seed
         self.rng = np.random.RandomState(seed)
 
         cuda_condition = torch.cuda.is_available() and train_config.use_cuda
@@ -35,17 +36,18 @@ class MTTrainer:
         self.train_config = train_config
         self.config = model.config
 
-        self.datasets_dict = create_datasets(self.config)
-        self.train_valid_indxs = {}
-        self.train_loaders_dict = {}
-        self.valid_loaders_dict = {}
-        self._create_train_valid_loaders()
+        self.train_dataset = None
+        self.valid_dataset = None
+        self.experiment_names = []
+        self.train_loader = None
+        self.valid_loader = None
+        self._setup_data()
 
         self.writer = None
 
         self.optim = None
         self.optim_schedule = None
-        self.setup_optim()
+        self._setup_optim()
 
         print("\nTotal Parameters:", sum([p.nelement() for p in self.model.parameters()]))
 
@@ -67,58 +69,51 @@ class MTTrainer:
 
         epochs_range = range(nb_epochs) if isinstance(nb_epochs, int) else nb_epochs
         for epoch in epochs_range:
-            self.iteration(self.train_loaders_dict, epoch=epoch)
+            self.iteration(self.train_loader, epoch=epoch)
 
             if (epoch + 1) % self.train_config.chkpt_freq == 0:
                 print('Saving chkpt:{:d}'.format(epoch+1))
                 # train_preds_dict, valid_preds_dict = self.evaluate_model()
-                save_model(
-                    self.model,
-                    prefix='chkpt:{:d}'.format(epoch+1),
-                    comment=comment)
+                save_model(self.model,
+                           prefix='chkpt:{:d}'.format(epoch+1),
+                           comment=comment)
 
-    def iteration(self, dataloaders_dict, epoch=0):
-        # TODO: make cum loss expt dependet and print the cum loss for each extp, as well has mean cum loss (over all expts)
-        cuml_loss = 0.0
+    def iteration(self, dataloader, epoch=0):
+        cuml_loss_dict = {expt: 0.0 for expt in self.experiment_names}
         cuml_reg_loss = 0.0
 
-        data_iterators = {k: iter(v) for k, v in dataloaders_dict.items()}
-        max_num_batches = max([len(dataloader) for dataloader in dataloaders_dict.values()])
-
-        pbar = tqdm(range(max_num_batches))
-        for i in pbar:
+        max_num_batches = len(dataloader)
+        pbar = tqdm(enumerate(dataloader), total=max_num_batches)
+        for i, [src_dict, tgt_dict] in pbar:
             losses_dict = {}
-            for expt, iterator in data_iterators.items():
-                try:
-                    data_tuple = next(iterator)
-                except StopIteration:
-                    data_iterators[expt] = iter(dataloaders_dict[expt])
-                    data_tuple = next(data_iterators[expt])
+            batch_data_dict = {expt: (src_dict[expt], tgt_dict[expt]) for expt in self.experiment_names}
 
+            for expt, data_tuple in batch_data_dict.items():
                 batch_data_tuple = _send_to_cuda(data_tuple, self.device)
 
-                batch_inputs = batch_data_tuple[0]
-                batch_targets = batch_data_tuple[1]
+                batch_src = batch_data_tuple[0]
+                batch_tgt = batch_data_tuple[1]
 
-                if torch.isnan(batch_inputs).sum().item():
+                if torch.isnan(batch_src).sum().item():
                     print("expt = {}. i = {}. nan encountered in inputs. moving on".format(expt, i))
                     continue
-                elif torch.isnan(batch_targets).sum().item():
+                elif torch.isnan(batch_tgt).sum().item():
                     print("expt = {}. i = {}. nan encountered in targets. moving on".format(expt, i))
                     continue
 
                 if self.config.multicell:
-                    pred = self.model(batch_inputs, expt)
+                    pred = self.model(batch_src, expt)
                 else:
-                    pred = self.model(batch_inputs)
-                loss = self.model.criterion(pred, batch_targets)
+                    pred = self.model(batch_src)
+
+                loss = self.model.criterion(pred, batch_tgt)
 
                 if torch.isnan(loss).sum().item():
                     print("expt = {}. i = {}. nan encountered in loss. moving on".format(expt, i))
                     continue
 
                 losses_dict.update({expt: loss})
-                cuml_loss += loss.item()
+                cuml_loss_dict[expt] += loss.item()
 
                 global_step = epoch * max_num_batches + i
                 if (global_step + 1) % self.train_config.log_freq == 0:
@@ -179,11 +174,15 @@ class MTTrainer:
 
             global_step = epoch * max_num_batches + i
             if i + 1 == max_num_batches:
-                desc2 = 'epoch # {:d}, avg loss: {:.5f}, avg reg loss: {:.5f}'
-                desc2 = desc2.format(
-                    epoch,
-                    cuml_loss / max_num_batches / len(dataloaders_dict),
+                msg0 = 'epoch {:d}, '.format(epoch)
+                msg1 = ""
+                for k, v in cuml_loss_dict.items():
+                    msg1 += "avg {}: {:.3f}, ".format(k, v / max_num_batches)
+                msg2 = " . . .  avg loss: {:.5f}, avg reg loss: {:.5f}"
+                msg2 = msg2.format(
+                    sum(cuml_loss_dict.values()) / max_num_batches / len(self.experiment_names),
                     cuml_reg_loss / max_num_batches / len(self.train_config.regularization))
+                desc2 = msg0 + msg1 + msg2
                 pbar.set_description(desc2)
             # TODO: add cum loss for all experiments, so it gets printed at the end of epoch
 
@@ -258,8 +257,12 @@ class MTTrainer:
 
         t = PrettyTable(['Experiment Name', 'Channel', 'Train NNLL', 'Valid NNLL', 'Train R^2', 'Valid R^2'])
 
-        for expt in self.config.experiment_names:
-            for cell in range(self.model.readout.nb_cells_dict[expt]):
+        for expt in self.datasets_dict.keys():
+            if self.config.multicell:
+                nb_cells = self.model.readout.nb_cells_dict[expt]
+            else:
+                nb_cells = 1
+            for cell in range(nb_cells):
                 t.add_row([
                     expt, cell,
                     np.round(train_nnll[expt][cell], 3),
@@ -286,7 +289,7 @@ class MTTrainer:
         self.model = new_model.to(self.device)
         self.model.extras_to_device(self.device)
 
-    def setup_optim(self):
+    def _setup_optim(self):
         if self.train_config.optim_choice == 'lamb':
             self.optim = Lamb(
                 filter(lambda p: p.requires_grad, self.model.parameters()),
@@ -319,30 +322,23 @@ class MTTrainer:
         else:
             raise ValueError("Invalid optimizer choice: {}".format(self.train_config.optim_chioce))
 
-    def _create_train_valid_loaders(self):
-        for expt, dataset in self.datasets_dict.items():
-            train_inds, valid_inds = generate_xv_folds(len(dataset), num_folds=self.train_config.xv_folds)
-            self.rng.shuffle(train_inds)
-            self.rng.shuffle(valid_inds)
+    def _setup_data(self):
+        train_dataset, valid_dataset, experiment_names = create_datasets(
+            self.config, self.train_config.xv_folds, self.rng)
+        self.train_dataset = train_dataset
+        self.valid_dataset = valid_dataset
+        self.experiment_names = experiment_names
 
-            train_loader = DataLoader(
-                dataset=dataset,
-                sampler=SubsetRandomSampler(train_inds),
-                batch_size=self.train_config.batch_size,
-                # pin_memory=True,
-                drop_last=True,
-            )
-            valid_loader = DataLoader(
-                dataset=dataset,
-                sampler=SubsetRandomSampler(valid_inds),
-                batch_size=self.train_config.batch_size,
-                # pin_memory=True,
-                drop_last=True,
-            )
-
-            self.train_valid_indxs.update({expt: (train_inds, valid_inds)})
-            self.train_loaders_dict.update({expt: train_loader})
-            self.valid_loaders_dict.update({expt: valid_loader})
+        self.train_loader = DataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.train_config.batch_size,
+            drop_last=True,
+        )
+        self.valid_loader = DataLoader(
+            dataset=self.valid_dataset,
+            batch_size=self.train_config.batch_size,
+            drop_last=True,
+        )
 
 
 def _send_to_cuda(data_tuple, device, dtype=torch.float32):

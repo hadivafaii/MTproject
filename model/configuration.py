@@ -16,6 +16,7 @@ class Config:
             nb_vel_tuning_units: List[int] = None,
             core_activation_fn: str = 'leaky_relu',
             readout_activation_fn: str = 'softplus',
+            rot_kernel_size: int = 5,
             spatial_kernel_size: int = 3,
             nb_rot_kernels: int = 20,
             nb_rotations: int = 8,
@@ -52,7 +53,7 @@ class Config:
         # multicell or shared configs
         self.core_activation_fn = core_activation_fn
         self.readout_activation_fn = readout_activation_fn
-        # self.nb_spatial_blocks = nb_spatial_blocks
+        self.rot_kernel_size = rot_kernel_size
         self.spatial_kernel_size = spatial_kernel_size
         self.nb_rot_kernels = nb_rot_kernels
         self.nb_rotations = nb_rotations

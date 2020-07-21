@@ -32,7 +32,6 @@ class MTTrainer:
         self.device = torch.device("cuda" if cuda_condition else "cpu")
 
         self.model = model.to(self.device)
-        self.model.extras_to_device(self.device)
         self.train_config = train_config
         self.config = model.config
 
@@ -197,46 +196,30 @@ class MTTrainer:
         preds_dict = {}
 
         if mode == 'train':
-            for expt, loader in self.train_loaders_dict.items():
-                true_list = []
-                pred_list = []
-
-                for i, data_tuple in enumerate(loader):
-                    with torch.no_grad():
-                        if self.config.multicell:
-                            pred = self.model(data_tuple[0].to(self.device, dtype=torch.float), expt)
-                        else:
-                            pred = self.model(data_tuple[0].to(self.device, dtype=torch.float))
-
-                    true_list.append(data_tuple[1])
-                    pred_list.append(pred)
-
-                true = torch.cat(true_list)
-                pred = torch.cat(pred_list)
-
-                preds_dict.update({expt: (to_np(true), to_np(pred))})
-
+            loader = self.train_loader
         elif mode == 'valid':
-            for expt, loader in self.valid_loaders_dict.items():
-                true_list = []
-                pred_list = []
-
-                for i, data_tuple in enumerate(loader):
-                    with torch.no_grad():
-                        if self.config.multicell:
-                            pred = self.model(data_tuple[0].to(self.device, dtype=torch.float), expt)
-                        else:
-                            pred = self.model(data_tuple[0].to(self.device, dtype=torch.float))
-
-                    true_list.append(data_tuple[1])
-                    pred_list.append(pred)
-
-                true = torch.cat(true_list)
-                pred = torch.cat(pred_list)
-
-                preds_dict.update({expt: (to_np(true), to_np(pred))})
+            loader = self.valid_loader
         else:
             raise ValueError("Invalid mode: {}".format(mode))
+
+        for i, [src_dict, tgt_dict] in enumerate(loader):
+            batch_data_dict = {expt: (src_dict[expt], tgt_dict[expt]) for expt in self.experiment_names}
+
+            true_list = []
+            pred_list = []
+            for expt, data_tuple in batch_data_dict.items():
+                batch_data_tuple = _send_to_cuda(data_tuple, self.device)
+                with torch.no_grad():
+                    if self.config.multicell:
+                        pred = self.model(batch_data_tuple[0], expt)
+                    else:
+                        pred = self.model(batch_data_tuple[0])
+
+                true_list.append(batch_data_tuple[1])
+                pred_list.append(pred)
+                true = torch.cat(true_list)
+                pred = torch.cat(pred_list)
+                preds_dict.update({expt: (to_np(true), to_np(pred))})
 
         return preds_dict
 
@@ -257,7 +240,7 @@ class MTTrainer:
 
         t = PrettyTable(['Experiment Name', 'Channel', 'Train NNLL', 'Valid NNLL', 'Train R^2', 'Valid R^2'])
 
-        for expt in self.datasets_dict.keys():
+        for expt in self.experiment_names:
             if self.config.multicell:
                 nb_cells = self.model.readout.nb_cells_dict[expt]
             else:
@@ -287,7 +270,6 @@ class MTTrainer:
 
     def swap_model(self, new_model):
         self.model = new_model.to(self.device)
-        self.model.extras_to_device(self.device)
 
     def _setup_optim(self):
         if self.train_config.optim_choice == 'lamb':

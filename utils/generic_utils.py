@@ -21,7 +21,7 @@ def convert_time(time_in_secs):
     print("\nd / hh:mm:ss   --->   %d / %d:%d:%d\n" % (d, h, m, s))
 
 
-def plot_vel_field(data, fig_size=(14, 3), scale=None, save_file=None, estimate_center=True):
+def plot_vel_field(data, fig_size=(14, 3), scale=None, save_file=None, estimate_center=False):
     if data.shape[-1] == 2:
         grd = data.shape[0]
         uu, vv = data[..., 0], data[..., 1]

@@ -26,8 +26,6 @@ class MTNet(nn.Module):
         self.readout = MTReadout(config, self.core.output_size)
 
         self.criterion = nn.PoissonNLLLoss(log_input=False)
-        self.reg_mats_dict = create_reg_mat(config.time_lags, self.core.rot_conv2d.kernel_size[0])
-
         self.init_weights()
         print_num_params(self)
 
@@ -49,11 +47,6 @@ class MTNet(nn.Module):
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
-
-    def extras_to_device(self, device):
-        for reg_type, reg_mat in self.reg_mats_dict.items():
-            self.reg_mats_dict[reg_type] = reg_mat.to(device)
-        self.core.rot_conv2d.rot_mat_to_device(device)
 
 
 class MTReadout(nn.Module):
@@ -104,14 +97,15 @@ class MTRotatioanlConvCore(nn.Module):
         self.spatial_fc = weight_norm(nn.Linear(config.grid_size ** 2, config.nb_spatial_readouts, bias=False))
         self.nb_spatial_conv_channels = config.nb_rotations * config.nb_rot_kernels * config.nb_temporal_kernels
         self.nb_conv_layers = int(np.floor(np.log2(config.grid_size)))
-        self.chomp = Chomp(chomp_size=config.spatial_kernel_size - 1, nb_dims=2)
+        self.chomp1 = Chomp(chomp_size=config.rot_kernel_size - 1, nb_dims=2)
+        self.chomp2 = Chomp(chomp_size=config.spatial_kernel_size - 1, nb_dims=2)
 
         self.rot_conv2d = weight_norm(RotConv2d(
             in_channels=2,
             out_channels=config.nb_rot_kernels,
             nb_rotations=config.nb_rotations,
-            kernel_size=config.spatial_kernel_size,
-            padding=config.spatial_kernel_size - 1))
+            kernel_size=config.rot_kernel_size,
+            padding=config.rot_kernel_size - 1))
 
         convs_list = []
         poolers_list = []
@@ -146,7 +140,7 @@ class MTRotatioanlConvCore(nn.Module):
 
         for i in range(self.nb_conv_layers):
             x_pool = self.poolers[i](outputs[i])
-            x = self.chomp(self.convs[i](x_pool))
+            x = self.chomp2(self.convs[i](x_pool))
             x = self.activation(x + x_pool)
             x1 = self.spatial_fcs[i+1](x.flatten(start_dim=2)).flatten(start_dim=1)
             outputs += (x,)
@@ -161,7 +155,7 @@ class MTRotatioanlConvCore(nn.Module):
 
         # spatial part
         x = x.flatten(end_dim=1)  # N * nb_temp_ch x 2 x grd x grd
-        x = self.chomp(self.rot_conv2d(x))  # N * nb_temp_ch x nb_rot * nb_rot_kers x grd x grd
+        x = self.chomp1(self.rot_conv2d(x))  # N * nb_temp_ch x nb_rot * nb_rot_kers x grd x grd
         x = x.view(
              -1, self.config.nb_temporal_kernels,
              self.config.nb_rotations * self.config.nb_rot_kernels,
@@ -203,8 +197,8 @@ class RotConv2d(nn.Conv2d):
             padding_mode=padding_mode)
 
         self.nb_rotations = nb_rotations
-        self.rotation_mat = None
-        self._build_rotation_mat()
+        rotation_mat = self._build_rotation_mat()
+        self.register_buffer('rotation_mat', rotation_mat)
 
         if bias:
             self.bias = nn.Parameter(
@@ -217,11 +211,9 @@ class RotConv2d(nn.Conv2d):
     def _build_rotation_mat(self):
         thetas = np.deg2rad(np.arange(0, 360, 360 / self.nb_rotations))
         c, s = np.cos(thetas), np.sin(thetas)
-        self.rotation_mat = torch.tensor(
+        rotation_mat = torch.tensor(
             [[c, -s], [s, c]], dtype=torch.float).permute(2, 0, 1)
-
-    def rot_mat_to_device(self, device):
-        self.rotation_mat = self.rotation_mat.to(device)
+        return rotation_mat
 
     def _get_augmented_weight(self):
         w = torch.einsum('jkn, inlm -> ijklm', self.rotation_mat, self.weight)

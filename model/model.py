@@ -94,7 +94,6 @@ class MTRotatioanlConvCore(nn.Module):
         self.config = config
 
         self.temporal_fc = nn.Linear(config.time_lags, config.nb_temporal_kernels, bias=False)
-        self.spatial_fc = weight_norm(nn.Linear(config.grid_size ** 2, config.nb_spatial_readouts, bias=False))
         self.nb_spatial_conv_channels = config.nb_rotations * config.nb_rot_kernels * config.nb_temporal_kernels
         self.nb_conv_layers = int(np.floor(np.log2(config.grid_size)))
         self.chomp1 = Chomp(chomp_size=config.rot_kernel_size - 1, nb_dims=2)

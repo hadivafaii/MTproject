@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 from tensorboardX import SummaryWriter
 
-from .dataset import create_datasets, generate_xv_folds
+from .dataset import create_datasets, normalize_fn
 from .optimizer import Lamb, log_lamb_rs, ScheduledOptim
 from .model_utils import save_model, compute_reg_loss, get_null_adj_nll
 
@@ -35,11 +35,9 @@ class MTTrainer:
         self.train_config = train_config
         self.config = model.config
 
-        self.train_dataset = None
-        self.valid_dataset = None
+        self.dataset = None
         self.experiment_names = []
         self.train_loader = None
-        self.valid_loader = None
         self._setup_data()
 
         self.writer = None
@@ -183,8 +181,8 @@ class MTTrainer:
                     cuml_reg_loss / max_num_batches / len(self.train_config.regularization))
                 desc2 = msg0 + msg1 + msg2
                 pbar.set_description(desc2)
-            # TODO: add cum loss for all experiments, so it gets printed at the end of epoch
 
+                # TODO: add writer to print stuff during training
                 # self.writer.add_embedding(
                 #   self.model.get_word_embeddings(self.device),
                 #   metadata=list(self.model.nlp.i2w.values()),
@@ -195,19 +193,37 @@ class MTTrainer:
         self.model.eval()
         preds_dict = {}
 
-        if mode == 'train':
-            loader = self.train_loader
-        elif mode == 'valid':
-            loader = self.valid_loader
-        else:
-            raise ValueError("Invalid mode: {}".format(mode))
+        for expt in self.experiment_names:
+            if mode == 'train':
+                indxs = self.dataset.train_indxs[expt]
+            elif mode == 'valid':
+                indxs = self.dataset.valid_indxs[expt]
+            else:
+                raise ValueError("Invalid mode: {}".format(mode))
 
-        for i, [src_dict, tgt_dict] in enumerate(loader):
-            batch_data_dict = {expt: (src_dict[expt], tgt_dict[expt]) for expt in self.experiment_names}
+            src = []
+            tgt = []
+            for idx in indxs:
+                src.append(np.expand_dims(self.dataset.stim[expt][..., idx - self.config.time_lags: idx], axis=0))
+                tgt.append(np.expand_dims(self.dataset.spks[expt][idx], axis=0))
 
+            src = np.concatenate(src).astype(float)
+            tgt = np.concatenate(tgt).astype(float)
+
+            num_batches = int(np.ceil(len(indxs) / self.train_config.batch_size))
             true_list = []
             pred_list = []
-            for expt, data_tuple in batch_data_dict.items():
+            for b in range(num_batches):
+                start = b * self.train_config.batch_size
+                end = min((b + 1) * self.train_config.batch_size, len(indxs))
+
+                src_slice = src[range(start, end)]
+                original_shape = src_slice.shape
+                src_slice_normalized = normalize_fn(src_slice.reshape(original_shape[0], -1), dim=-1)
+
+                data_tuple = (src_slice_normalized.reshape(original_shape), tgt[range(start, end)])
+                data_tuple = tuple(map(lambda z: torch.tensor(z), data_tuple))
+
                 batch_data_tuple = _send_to_cuda(data_tuple, self.device)
                 with torch.no_grad():
                     if self.config.multicell:
@@ -217,9 +233,10 @@ class MTTrainer:
 
                 true_list.append(batch_data_tuple[1])
                 pred_list.append(pred)
-                true = torch.cat(true_list)
-                pred = torch.cat(pred_list)
-                preds_dict.update({expt: (to_np(true), to_np(pred))})
+
+            true = torch.cat(true_list)
+            pred = torch.cat(pred_list)
+            preds_dict.update({expt: (to_np(true), to_np(pred))})
 
         return preds_dict
 
@@ -255,7 +272,10 @@ class MTTrainer:
                 ])
 
         print(t)
-        print('avg valid nnll: {:.3f}, r2: {:.1f} {} \n\n'.format(
+        print('avg train nnll: {:.4f}, r2: {:.2f} {}'.format(
+            np.mean([np.mean(item) for item in train_nnll.values()]),
+            np.mean([np.mean(item) for item in train_r2.values()]), '%'))
+        print('avg valid nnll: {:.4f}, r2: {:.2f} {} \n\n'.format(
             np.mean([np.mean(item) for item in valid_nnll.values()]),
             np.mean([np.mean(item) for item in valid_r2.values()]), '%'))
 
@@ -305,21 +325,14 @@ class MTTrainer:
             raise ValueError("Invalid optimizer choice: {}".format(self.train_config.optim_chioce))
 
     def _setup_data(self):
-        train_dataset, valid_dataset, experiment_names = create_datasets(
-            self.config, self.train_config.xv_folds, self.rng)
-        self.train_dataset = train_dataset
-        self.valid_dataset = valid_dataset
+        dataset, experiment_names = create_datasets(self.config, self.train_config.xv_folds, self.rng)
+        self.dataset = dataset
         self.experiment_names = experiment_names
 
         self.train_loader = DataLoader(
-            dataset=self.train_dataset,
+            dataset=self.dataset,
             batch_size=self.train_config.batch_size,
-            drop_last=True,
-        )
-        self.valid_loader = DataLoader(
-            dataset=self.valid_dataset,
-            batch_size=self.train_config.batch_size,
-            drop_last=True,
+            drop_last=False,
         )
 
 

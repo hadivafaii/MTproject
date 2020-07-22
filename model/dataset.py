@@ -14,10 +14,15 @@ sns.set_style('dark')
 class MTDataset(Dataset):
     def __init__(self, data_dict, time_lage, transform=None):
 
-        self.data_dict = data_dict
+        self.stim = {expt: data['stim'] for (expt, data) in data_dict.items()}
+        self.spks = {expt: data['spks'] for (expt, data) in data_dict.items()}
+        self.train_indxs = {expt: data['train_indxs'] for (expt, data) in data_dict.items()}
+        self.valid_indxs = {expt: data['valid_indxs'] for (expt, data) in data_dict.items()}
+
         self.time_lags = time_lage
         self.transform = transform
-        self.lengths = {expt: len(data['indxs']) for (expt, data) in self.data_dict.items()}
+
+        self.lengths = {expt: len(item) for (expt, item) in self.train_indxs.items()}
 
     def __len__(self):
         return max(list(self.lengths.values()))
@@ -27,11 +32,11 @@ class MTDataset(Dataset):
             idx = idx.tolist()
 
         source = {
-            expt: data['stim'][..., data['indxs'][idx % self.lengths[expt]] - self.time_lags: data['indxs'][idx % self.lengths[expt]]] for
-            (expt, data) in self.data_dict.items()}
+            expt: stim[..., self.train_indxs[expt][idx % self.lengths[expt]] - self.time_lags: self.train_indxs[expt][idx % self.lengths[expt]]] for
+            (expt, stim) in self.stim.items()}
         target = {
-            expt: data['spks'][data['indxs'][idx % self.lengths[expt]]] for
-            (expt, data) in self.data_dict.items()}
+            expt: spks[self.train_indxs[expt][idx % self.lengths[expt]]] for
+            (expt, spks) in self.spks.items()}
 
         if self.transform is not None:
             source = self.transform(source)
@@ -39,61 +44,36 @@ class MTDataset(Dataset):
         return source, target
 
 
-def normalize_fn(x):
+def normalize_fn(x, dim=None):
     if isinstance(x, dict):
-        return {k: v / v.std() for (k, v) in x.items()}
+        return {k: v / v.std(axis=dim, keepdims=True) for (k, v) in x.items()}
     else:
-        return x / x.std()
+        return x / x.std(axis=dim, keepdims=True)
 
 
 def create_datasets(config, xv_folds, rng):
     data_dict_all = _load_data(config)
-    train_data_all = {}
-    valid_data_all = {}
+    final = {}
     for expt, data_dict in data_dict_all.items():
         nt = len(data_dict['good_indxs'])
         train_inds, valid_inds = generate_xv_folds(nt, num_folds=xv_folds)
         rng.shuffle(train_inds)
         rng.shuffle(valid_inds)
 
-        #train_stim = []
-        #train_spks = []
-        #for idx in data_dict['good_indxs'][train_inds]:
-        #    train_stim.append(np.expand_dims(data_dict['stim'][..., idx - config.time_lags: idx], axis=0))
-        #    train_spks.append(np.expand_dims(data_dict['spks'][idx], axis=0))
-        #train_stim = np.concatenate(train_stim)
-        #train_spks = np.concatenate(train_spks)
-
-        #valid_stim = []
-        #valid_spks = []
-        #for idx in data_dict['good_indxs'][valid_inds]:
-        #    valid_stim.append(np.expand_dims(data_dict['stim'][..., idx - config.time_lags: idx], axis=0))
-        #    valid_spks.append(np.expand_dims(data_dict['spks'][idx], axis=0))
-        #valid_stim = np.concatenate(valid_stim)
-        #valid_spks = np.concatenate(valid_spks)
-
-        train_data = {
+        data = {
             'stim': data_dict['stim'],
             'spks': data_dict['spks'],
-            'indxs': data_dict['good_indxs'][train_inds],
+            'train_indxs': data_dict['good_indxs'][train_inds],
+            'valid_indxs': data_dict['good_indxs'][valid_inds],
         }
-        valid_data = {
-            'stim': data_dict['stim'],
-            'spks': data_dict['spks'],
-            'indxs': data_dict['good_indxs'][valid_inds],
-        }
-
-        train_data_all.update({expt: train_data})
-        valid_data_all.update({expt: valid_data})
+        final.update({expt: data})
 
     if config.multicell:
-        train_dataset = MTDataset(train_data_all, config.time_lags, normalize_fn)
-        valid_dataset = MTDataset(valid_data_all, config.time_lags, normalize_fn)
+        dataset = MTDataset(final, config.time_lags, normalize_fn)
     else:
-        train_dataset = MTDataset(train_data_all, config.time_lags)
-        valid_dataset = MTDataset(valid_data_all, config.time_lags)
+        dataset = MTDataset(final, config.time_lags)
 
-    return train_dataset, valid_dataset, list(data_dict_all.keys())
+    return dataset, list(data_dict_all.keys())
 
 
 def generate_xv_folds(nt, num_folds=5, num_blocks=3, which_fold=None):

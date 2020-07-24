@@ -22,7 +22,8 @@ class MTNet(nn.Module):
 
         self.config = config
 
-        self.core = MTRotatioanlConvCore(config)
+        # self.core = MTRotatioanlConvCore(config)
+        self.core = MTRotatioanlConvCoreNew(config)
         self.readout = MTReadout(config, self.core.output_size)
 
         self.criterion = nn.PoissonNLLLoss(log_input=False)
@@ -108,7 +109,7 @@ class MTRotatioanlConvCore(nn.Module):
 
         convs_list = []
         poolers_list = []
-        spatial_fcs_list = [weight_norm(nn.Linear(config.grid_size ** 2, config.nb_spatial_readouts, bias=False))]
+        spatial_fcs_list = [weight_norm(nn.Linear(config.grid_size ** 2, config.nb_fc_units, bias=False))]
         for i in range(1, self.nb_conv_layers + 1):
             convs_list.append(weight_norm(nn.Conv2d(
                 in_channels=self.nb_spatial_conv_channels,
@@ -117,13 +118,13 @@ class MTRotatioanlConvCore(nn.Module):
                 padding=config.spatial_kernel_size - 1)))
             size = config.grid_size // (2 ** i)
             poolers_list.append(nn.AdaptiveAvgPool2d(size))
-            spatial_fcs_list.append(weight_norm(nn.Linear(size ** 2, config.nb_spatial_readouts, bias=False)))
+            spatial_fcs_list.append(weight_norm(nn.Linear(size ** 2, config.nb_fc_units, bias=False)))
 
         self.convs = nn.ModuleList(convs_list)
         self.poolers = nn.ModuleList(poolers_list)
         self.spatial_fcs = nn.ModuleList(spatial_fcs_list)
 
-        self.output_size = self.nb_spatial_conv_channels * config.nb_spatial_readouts * (self.nb_conv_layers + 1)
+        self.output_size = self.nb_spatial_conv_channels * config.nb_fc_units * (self.nb_conv_layers + 1)
         self.activation = get_activation_fn(config.core_activation_fn)
         print_num_params(self)
 
@@ -132,10 +133,10 @@ class MTRotatioanlConvCore(nn.Module):
         x1 = self.spatial_fcs[0](x.flatten(start_dim=2)).flatten(start_dim=1)
 
         outputs = ()
-        outputs_main = ()
+        outputs_flat = ()
 
         outputs += (x,)
-        outputs_main += (x1,)
+        outputs_flat += (x1,)
 
         for i in range(self.nb_conv_layers):
             x_pool = self.poolers[i](outputs[i])
@@ -143,9 +144,9 @@ class MTRotatioanlConvCore(nn.Module):
             x = self.activation(x + x_pool)
             x1 = self.spatial_fcs[i+1](x.flatten(start_dim=2)).flatten(start_dim=1)
             outputs += (x,)
-            outputs_main += (x1,)
+            outputs_flat += (x1,)
 
-        return torch.cat(outputs_main, dim=-1)
+        return torch.cat(outputs_flat, dim=-1)
 
     def _rot_st_fwd(self, x):
         # temporal part
@@ -160,6 +161,110 @@ class MTRotatioanlConvCore(nn.Module):
              self.config.nb_rotations * self.config.nb_rot_kernels,
              self.config.grid_size, self.config.grid_size)  # N x nb_temp_ch x nb_rot * nb_rot_kers x grd x grd
         x = x.flatten(start_dim=1, end_dim=2)  # N x C x grd x grd
+
+        return self.activation(x)
+
+
+class MTRotatioanlConvCoreNew(nn.Module):
+    def __init__(self, config):
+        super(MTRotatioanlConvCoreNew, self).__init__()
+
+        self.config = config
+
+        self.chomp1d = Chomp(chomp_sizes=config.first_temporal_kernel_size - 1, nb_dims=1)
+        self.chomp2d = Chomp(chomp_sizes=config.rot_kernel_size - 1, nb_dims=2)
+        self.chomp3d = Chomp(chomp_sizes=[
+            config.temporal_kernel_size - 1,
+            config.spatial_kernel_size - 1,
+            config.spatial_kernel_size - 1], nb_dims=3)
+
+        self.temporal_conv = weight_norm(nn.Conv1d(
+            in_channels=1,
+            out_channels=config.nb_temporal_kernels,
+            kernel_size=config.first_temporal_kernel_size,
+            padding=config.first_temporal_kernel_size - 1))
+
+        self.rot_conv2d = weight_norm(RotConv2d(
+            in_channels=2,
+            out_channels=config.nb_rot_kernels,
+            nb_rotations=config.nb_rotations,
+            kernel_size=config.rot_kernel_size,
+            padding=config.rot_kernel_size - 1))
+
+        self.nb_conv_channels = config.nb_rotations * config.nb_rot_kernels * config.nb_temporal_kernels
+        self.nb_conv_layers = int(np.floor(np.log2(config.grid_size)))
+
+        convs_list = []
+        dropouts_list = []
+        poolers_list = []
+        fcs_list = [weight_norm(nn.Linear(config.time_lags * config.grid_size ** 2, config.nb_fc_units, bias=True))]
+        for i in range(1, self.nb_conv_layers + 1):
+            convs_list.append(weight_norm(nn.Conv3d(
+                in_channels=self.nb_conv_channels,
+                out_channels=self.nb_conv_channels,
+                kernel_size=[config.temporal_kernel_size, config.spatial_kernel_size, config.spatial_kernel_size],
+                padding=[config.temporal_kernel_size - 1, config.spatial_kernel_size - 1, config.spatial_kernel_size - 1])
+            ))
+            dropouts_list.append(nn.Dropout(config.dropout))
+            pool_size = [config.time_lags // (2 ** i), config.grid_size // (2 ** i), config.grid_size // (2 ** i)]
+            poolers_list.append(nn.AdaptiveAvgPool3d(pool_size))
+            fcs_list.append(weight_norm(nn.Linear(np.prod(pool_size), config.nb_fc_units, bias=True)))
+
+        self.convs = nn.ModuleList(convs_list)
+        self.dropouts = nn.ModuleList(dropouts_list)
+        self.poolers = nn.ModuleList(poolers_list)
+        self.fcs = nn.ModuleList(fcs_list)
+
+        self.output_size = self.nb_conv_channels * config.nb_fc_units * (self.nb_conv_layers + 1)
+        self.activation = get_activation_fn(config.core_activation_fn)
+        self.dropout = nn.Dropout(config.dropout)
+        print_num_params(self)
+
+    def forward(self, x):
+        x = self._rot_fwd(x)  # N x C x tau x grd x grd
+        x1 = self.fcs[0](x.flatten(start_dim=2)).flatten(start_dim=1)  # N x C*nb_fc_units
+
+        outputs = ()
+        outputs_flat = ()
+
+        outputs += (x,)
+        outputs_flat += (x1,)
+
+        for i in range(self.nb_conv_layers):
+            x_pool = self.poolers[i](outputs[i])
+            x = self.chomp3d(self.convs[i](x_pool))
+            x = self.activation(x + x_pool)
+            x = self.dropouts[i](x)
+            x1 = self.fcs[i+1](x.flatten(start_dim=2)).flatten(start_dim=1)
+            outputs += (x,)
+            outputs_flat += (x1,)
+
+        x = torch.cat(outputs_flat, dim=-1)  # N x output_size
+        x = self.activation(x)
+        x = self.dropout(x)
+
+        return x
+
+    def _rot_fwd(self, x):
+        # temporal part
+        x = x.view(-1, self.config.time_lags).unsqueeze(1)  # N*2*grd*grd x 1 x tau
+        x = self.chomp1d(self.temporal_conv(x))  # N*2*grd*grd x nb_temp_kernels x tau
+        x = x.view(-1, 2,
+                   self.config.grid_size,
+                   self.config.grid_size,
+                   self.config.nb_temporal_kernels,
+                   self.config.time_lags)  # N x 2 x grd x grd x nb_temp_kernels x tau
+        x = x.permute(0, -1, -2, 1, 2, 3)  # N x tau x nb_temp_kernels x 2 x grd x grd
+
+        # spatial part
+        x = x.flatten(end_dim=2)  # N*tau*nb_temp_ch x 2 x grd x grd
+        x = self.chomp2d(self.rot_conv2d(x))  # N*tau*nb_temp_ch x nb_rot * nb_rot_kers x grd x grd
+        x = x.view(
+             -1, self.config.time_lags, self.config.nb_temporal_kernels,
+             self.config.nb_rotations * self.config.nb_rot_kernels,
+             self.config.grid_size, self.config.grid_size)  # N x tau x nb_temp_ch x nb_rot*nb_rot_kers x grd x grd
+        x = x.permute(0, 2, 3, 1, 4, 5)  # N x nb_temp_ch x nb_rot*nb_rot_kers x tau x grd x grd
+        x = x.flatten(start_dim=1, end_dim=2)  # N x C x tau x grd x grd
 
         return self.activation(x)
 
@@ -275,16 +380,24 @@ class TemporalConvNet(nn.Module):
 
 
 class Chomp(nn.Module):
-    def __init__(self, chomp_size, nb_dims):
+    def __init__(self, chomp_sizes: Union[int, Tuple[int], Tuple[int, int], Tuple[int, int, int]], nb_dims):
         super(Chomp, self).__init__()
-        self.chomp_size = chomp_size
+        if isinstance(chomp_sizes, int):
+            self.chomp_sizes = [chomp_sizes] * nb_dims
+        else:
+            self.chomp_sizes = chomp_sizes
+
+        assert len(self.chomp_sizes) == nb_dims, "must enter a chomp size for each dim"
+
         self.nb_dims = nb_dims
 
     def forward(self, x):
         if self.nb_dims == 1:
-            return x[:, :, :-self.chomp_size].contiguous()
+            return x[:, :, :-self.chomp_sizes[0]].contiguous()
         elif self.nb_dims == 2:
-            return x[:, :, :-self.chomp_size, :-self.chomp_size].contiguous()
+            return x[:, :, :-self.chomp_sizes[0], :-self.chomp_sizes[1]].contiguous()
+        elif self.nb_dims == 3:
+            return x[:, :, :-self.chomp_sizes[0], :-self.chomp_sizes[1], :-self.chomp_sizes[2]].contiguous()
         else:
             raise RuntimeError("Invalid number of dims")
 

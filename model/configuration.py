@@ -1,12 +1,12 @@
 import os
 from os.path import join as pjoin
-from typing import List
+from typing import List, Union
 
 
 class Config:
     def __init__(
         self,
-            experiment_names: List[str] = None,
+            experiment_names: Union[str, List[str]] = None,
             predictive_model: bool = False,
             grid_size: int = 15,
             temporal_res: int = 25,
@@ -16,17 +16,18 @@ class Config:
             nb_vel_tuning_units: List[int] = None,
             core_activation_fn: str = 'leaky_relu',
             readout_activation_fn: str = 'softplus',
-            rot_kernel_size: int = 5,
-            spatial_kernel_size: int = 3,
-            nb_rot_kernels: int = 20,
+            rot_kernel_size: int = 2,
+            spatial_kernel_size: int = 2,
+            nb_rot_kernels: int = 10,
             nb_rotations: int = 8,
-            nb_spatial_readouts: int = 100,
+            nb_fc_units: int = 50,
             nb_temporal_kernels: int = 3,
-            temporal_kernel_size: int = 3,
-            nb_temporal_units: int = None,
+            first_temporal_kernel_size: int = 2,
+            temporal_kernel_size: int = 2,
+            # nb_temporal_units: int = None,
             # nb_spatial_blocks: int = 3,
-            dropout: float = 0.1,
-            layer_norm_eps=1e-12,
+            dropout: float = 0.0,
+            layer_norm_eps: float = 1e-12,
             base_dir: str = 'Documents/PROJECTS/MT_LFP',
             data_file: str = None,
     ):
@@ -57,13 +58,17 @@ class Config:
         self.spatial_kernel_size = spatial_kernel_size
         self.nb_rot_kernels = nb_rot_kernels
         self.nb_rotations = nb_rotations
-        self.nb_spatial_readouts = nb_spatial_readouts
-        self.nb_temporal_kernels = nb_temporal_kernels
+
+        self.first_temporal_kernel_size = first_temporal_kernel_size
         self.temporal_kernel_size = temporal_kernel_size
-        if nb_temporal_units is None:
-            self.nb_temporal_units = [10, 10, 10]
-        else:
-            self.nb_temporal_units = nb_temporal_units
+        self.nb_temporal_kernels = nb_temporal_kernels
+
+        self.nb_fc_units = nb_fc_units
+
+        # if nb_temporal_units is None:
+        #     self.nb_temporal_units = [10, 10, 10]
+        # else:
+        #     self.nb_temporal_units = nb_temporal_units
         self.dropout = dropout
         self.layer_norm_eps = layer_norm_eps
 

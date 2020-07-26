@@ -20,7 +20,8 @@ class Config:
             spatial_kernel_size: int = 2,
             nb_rot_kernels: int = 10,
             nb_rotations: int = 8,
-            nb_fc_units: int = 50,
+            nb_spatial_units: int = 50,
+            # nb_temporal_fcs: int = 50,
             nb_temporal_kernels: int = 3,
             first_temporal_kernel_size: int = 2,
             temporal_kernel_size: int = 2,
@@ -63,7 +64,8 @@ class Config:
         self.temporal_kernel_size = temporal_kernel_size
         self.nb_temporal_kernels = nb_temporal_kernels
 
-        self.nb_fc_units = nb_fc_units
+        self.nb_spatial_units = nb_spatial_units
+        # self.nb_temporal_fcs = nb_temporal_fcs
 
         # if nb_temporal_units is None:
         #     self.nb_temporal_units = [10, 10, 10]

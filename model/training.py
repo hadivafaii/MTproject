@@ -7,6 +7,7 @@ from sklearn.metrics import r2_score
 from prettytable import PrettyTable
 
 import torch
+from torch import nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
@@ -31,7 +32,13 @@ class MTTrainer:
         cuda_condition = torch.cuda.is_available() and train_config.use_cuda
         self.device = torch.device("cuda" if cuda_condition else "cpu")
 
-        self.model = model.to(self.device)
+        if train_config.use_cuda and torch.cuda.device_count() > 1:
+            print("Using {:d} GPUs".format(torch.cuda.device_count()))
+            self.model = nn.DataParallel(model)
+            self.model = self.model.to(self.device)
+        else:
+            self.model = model.to(self.device)
+
         self.train_config = train_config
         self.config = model.config
 
@@ -71,9 +78,14 @@ class MTTrainer:
             if (epoch + 1) % self.train_config.chkpt_freq == 0:
                 print('Saving chkpt:{:d}'.format(epoch+1))
                 # train_preds_dict, valid_preds_dict = self.evaluate_model()
-                save_model(self.model,
-                           prefix='chkpt:{:d}'.format(epoch+1),
-                           comment=comment)
+                if isinstance(self.model, nn.DataParallel):
+                    save_model(self.model.module,
+                               prefix='chkpt:{:d}'.format(epoch+1),
+                               comment=comment)
+                else:
+                    save_model(self.model,
+                               prefix='chkpt:{:d}'.format(epoch+1),
+                               comment=comment)
 
     def iteration(self, dataloader, epoch=0):
         cuml_loss_dict = {expt: 0.0 for expt in self.experiment_names}
@@ -103,7 +115,10 @@ class MTTrainer:
                 else:
                     pred = self.model(batch_src)
 
-                loss = self.model.criterion(pred, batch_tgt)
+                if isinstance(self.model, nn.DataParallel):
+                    loss = self.model.module.criterion(pred, batch_tgt)
+                else:
+                    loss = self.model.criterion(pred, batch_tgt)
 
                 if torch.isnan(loss).sum().item():
                     print("expt = {}. i = {}. nan encountered in loss. moving on".format(expt, i))
@@ -259,7 +274,10 @@ class MTTrainer:
 
         for expt in self.experiment_names:
             if self.config.multicell:
-                nb_cells = self.model.readout.nb_cells_dict[expt]
+                if isinstance(self.model, nn.DataParallel):
+                    nb_cells = self.model.module.readout.nb_cells_dict[expt]
+                else:
+                    nb_cells = self.model.readout.nb_cells_dict[expt]
             else:
                 nb_cells = 1
             for cell in range(nb_cells):
@@ -289,6 +307,7 @@ class MTTrainer:
         return output
 
     def swap_model(self, new_model):
+        # TODO: does this need to be updated for DataParallel?
         self.model = new_model.to(self.device)
 
     def _setup_optim(self):

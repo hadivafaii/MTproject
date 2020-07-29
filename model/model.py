@@ -23,10 +23,10 @@ class MTNet(nn.Module):
 
         self.config = config
 
-        self.core = MTRotationalDenseCore(config)
-        # self.core = MTRotatioanlConvCore(config)
+        # self.core = MTRotationalDenseCore(config)
+        self.core = MTRotatioanlConvCore(config)
         # self.core = MTRotatioanlConvCoreNew(config)
-        self.readout = MTReadout(config, sum(self.core.nb_conv_units))
+        self.readout = MTReadout(config, self.core.output_size)
 
         self.criterion = nn.PoissonNLLLoss(log_input=False)
         self.init_weights()
@@ -59,26 +59,26 @@ class MTReadout(nn.Module):
         self.config = config
         self.hidden_size = hidden_size
 
-        load_dir = pjoin(config.base_dir, 'extra_info')
-        nb_cells_dict = np.load(pjoin(load_dir, "nb_cells_dict.npy"), allow_pickle=True).item()
-        ctrs_dict = np.load(pjoin(load_dir, "ctrs_dict.npy"), allow_pickle=True).item()
-        if config.experiment_names is not None:
-            self.nb_cells_dict = {expt: nb_cells_dict[expt] for expt in config.experiment_names}
-            self.ctrs_dict = {expt: ctrs_dict[expt] for expt in config.experiment_names}
-        else:
-            self.nb_cells_dict = nb_cells_dict
-            self.ctrs_dict = ctrs_dict
+        # load_dir = pjoin(config.base_dir, 'extra_info')
+        # nb_cells_dict = np.load(pjoin(load_dir, "nb_cells_dict.npy"), allow_pickle=True).item()
+        # ctrs_dict = np.load(pjoin(load_dir, "ctrs_dict.npy"), allow_pickle=True).item()
+        # if config.experiment_names is not None:
+             # self.nb_cells_dict = {expt: nb_cells_dict[expt] for expt in config.experiment_names}
+             # self.ctrs_dict = {expt: ctrs_dict[expt] for expt in config.experiment_names}
+        # else:
+             # self.nb_cells_dict = nb_cells_dict
+             # self.ctrs_dict = ctrs_dict
 
-        self.spatial_fc = nn.Linear(config.grid_size ** 2, config.nb_spatial_units, bias=False)
-        self.norm = nn.LayerNorm(hidden_size * config.nb_spatial_units, config.layer_norm_eps)
+        # self.spatial_fc = nn.Linear(config.grid_size ** 2, config.nb_spatial_units, bias=False)
+        self.norm = nn.LayerNorm(hidden_size, config.layer_norm_eps)
 
         # TODO: idea, you can replace a linear layer with FF and some dim reduction:
         #  hidden_dim -> readout_dim (e.g. 80)
         # spatial_fcs = {}
         layers = {}
-        for expt, nb_cells in self.nb_cells_dict.items():
+        for expt, good_channels in config.useful_cells.items():
             # spatial_fcs.update({expt: nn.Linear(config.grid_size ** 2, config.nb_spatial_fcs, bias=False)})
-            layers.update({expt: nn.Linear(hidden_size * config.nb_spatial_units, nb_cells, bias=True)})
+            layers.update({expt: nn.Linear(hidden_size, len(good_channels), bias=True)})
         # self.spatial_fcs = nn.ModuleDict(spatial_fcs)
         self.layers = nn.ModuleDict(layers)
 
@@ -86,8 +86,8 @@ class MTReadout(nn.Module):
         print_num_params(self)
 
     def forward(self, x, experiment_name: str):
-        # input is N x hidden_size x grd**2
-        x = self.spatial_fc(x).flatten(start_dim=1)  # N x hidden_size*nb_spatial_units
+        # input is N x hidden_size
+        # x = self.spatial_fc(x).flatten(start_dim=1)  # N x hidden_size*nb_spatial_units
         x = self.norm(x)
         y = self.layers[experiment_name](x)  # N x nb_cells
         y = self.activation(y)
@@ -115,18 +115,17 @@ class MTRotationalDenseCore(nn.Module):
 
         nb_rot_out_channels = config.nb_rotations * config.nb_rot_kernels * config.nb_temporal_kernels
         self.nb_conv_layers = int(np.floor(np.log2(config.grid_size)))
-        nb_conv_units = [nb_rot_out_channels] + [128, 256, 512]
+        self.nb_conv_units = [nb_rot_out_channels] + [128, 256, 512]
 
         # deeper spatial part
         convs_list = []
         downsamples_list = []
         dropouts_list = []
         poolers_list = []
-        spatial_fcs_list = [nn.Linear(config.grid_size ** 2, config.nb_spatial_fcs, bias=True)]
         self.pad_sizes = []
         for i in range(1, self.nb_conv_layers + 1):
-            in_channels = nb_conv_units[i-1]
-            out_channels = nb_conv_units[i]
+            in_channels = self.nb_conv_units[i-1]
+            out_channels = self.nb_conv_units[i]
 
             convs_list.append(weight_norm(nn.Conv2d(
                 in_channels=in_channels,
@@ -139,16 +138,13 @@ class MTRotationalDenseCore(nn.Module):
             dropouts_list.append(nn.Dropout(config.dropout))
             pool_size = config.grid_size // (2 ** i)
             poolers_list.append(nn.AdaptiveAvgPool2d(pool_size))
-            spatial_fcs_list.append(nn.Linear(pool_size ** 2, config.nb_spatial_fcs, bias=True))
             self.pad_sizes.append((config.grid_size - pool_size) // 2)
 
         self.convs = nn.ModuleList(convs_list)
         self.downsamples = nn.ModuleList(downsamples_list)
         self.dropouts = nn.ModuleList(dropouts_list)
         self.poolers = nn.ModuleList(poolers_list)
-        self.spatial_fcs = nn.ModuleList(spatial_fcs_list)
 
-        # self.output_size = sum(self.nb_conv_units)
         self.activation = get_activation_fn(config.core_activation_fn)
         self.dropout = nn.Dropout(config.dropout)
         print_num_params(self)
@@ -217,14 +213,15 @@ class MTRotatioanlConvCore(nn.Module):
 
         self.nb_rot_out_channels = config.nb_rotations * config.nb_rot_kernels * config.nb_temporal_kernels
         self.nb_conv_layers = int(np.floor(np.log2(config.grid_size)))
-        self.nb_conv_units = [self.nb_rot_out_channels] + [64, 64, 64]
+        self.nb_conv_units = [self.nb_rot_out_channels] * 4
+        # self.nb_conv_units = [self.nb_rot_out_channels] + [64, 64, 64]
 
         # deeper spatial part
         convs_list = []
         downsamples_list = []
         dropouts_list = []
         poolers_list = []
-        spatial_fcs_list = [nn.Linear(config.grid_size ** 2, config.nb_spatial_fcs, bias=True)]
+        spatial_fcs_list = [nn.Linear(config.grid_size ** 2, config.nb_spatial_units[0], bias=False)]
         for i in range(1, self.nb_conv_layers + 1):
             in_channels = self.nb_conv_units[i-1]
             out_channels = self.nb_conv_units[i]
@@ -240,7 +237,7 @@ class MTRotatioanlConvCore(nn.Module):
             dropouts_list.append(nn.Dropout(config.dropout))
             pool_size = config.grid_size // (2 ** i)
             poolers_list.append(nn.AdaptiveAvgPool2d(pool_size))
-            spatial_fcs_list.append(nn.Linear(pool_size ** 2, config.nb_spatial_fcs, bias=True))
+            spatial_fcs_list.append(nn.Linear(pool_size ** 2, config.nb_spatial_units[i], bias=False))
 
         self.convs = nn.ModuleList(convs_list)
         self.downsamples = nn.ModuleList(downsamples_list)
@@ -248,7 +245,7 @@ class MTRotatioanlConvCore(nn.Module):
         self.poolers = nn.ModuleList(poolers_list)
         self.spatial_fcs = nn.ModuleList(spatial_fcs_list)
 
-        self.output_size = sum(self.nb_conv_units) * config.nb_spatial_fcs
+        self.output_size = sum([np.prod(tup) for tup in zip(self.nb_conv_units, config.nb_spatial_units)])
         self.activation = get_activation_fn(config.core_activation_fn)
         self.dropout = nn.Dropout(config.dropout)
         print_num_params(self)
@@ -275,7 +272,7 @@ class MTRotatioanlConvCore(nn.Module):
             outputs_flat += (x1,)
 
         x = torch.cat(outputs_flat, dim=-1)
-        x = self.activation(x)
+        # x = self.activation(x)
 
         return x
 

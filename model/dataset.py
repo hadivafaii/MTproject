@@ -73,7 +73,7 @@ def create_datasets(config, xv_folds, rng):
     else:
         dataset = MTDataset(final, config.time_lags)
 
-    return dataset, list(data_dict_all.keys())
+    return dataset
 
 
 def generate_xv_folds(nt, num_folds=5, num_blocks=3, which_fold=None):
@@ -116,11 +116,11 @@ def _load_data(config):
     data_dict = {}
 
     ff = h5py.File(config.data_file, 'r')
-    for key in tqdm(ff.keys()):
-        if config.experiment_names is not None and key not in config.experiment_names:
+    for expt in tqdm(ff.keys()):
+        if expt not in config.useful_cells.keys():
             continue
 
-        grp = ff[key]
+        grp = ff[expt]
 
         badspks = np.array(grp['badspks'])
         goodspks = 1 - badspks
@@ -129,10 +129,12 @@ def _load_data(config):
 
         stim = np.transpose(np.array(grp['stim']), (3, 1, 2, 0))   # 2 x grd x grd x nt
         nt = stim.shape[-1]
-        num_channels = np.array(grp['num_channels']).item()
-        spks = np.zeros((nt, num_channels))
-        for cc in range(num_channels):
-            spks[:, cc] = np.array(grp['ch_%d' % cc]['spks_%d' % cc]).squeeze()
+
+        good_channels = config.useful_cells[expt]
+        spks = np.zeros((nt, len(good_channels)))
+
+        for i, cc in enumerate(good_channels):
+            spks[:, i] = np.array(grp['ch_%d' % cc]['spks_%d' % cc]).squeeze()
 
         _eps = 0.1
         stim_norm = norm(stim.reshape(-1, nt), axis=0)
@@ -149,7 +151,7 @@ def _load_data(config):
             'spks': spks.astype(float),
             'good_indxs': true_good_indxs.astype(int),
         }
-        data_dict.update({key: _data})
+        data_dict.update({expt: _data})
 
     ff.close()
 

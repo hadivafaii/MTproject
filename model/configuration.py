@@ -1,12 +1,14 @@
 import os
+import numpy as np
+import pandas as pd
 from os.path import join as pjoin
-from typing import List, Union
+from typing import List, Union, Dict
 
 
 class Config:
     def __init__(
         self,
-            experiment_names: Union[str, List[str]] = None,
+            useful_cells: Dict[str, list] = None,
             predictive_model: bool = False,
             grid_size: int = 15,
             temporal_res: int = 25,
@@ -20,7 +22,7 @@ class Config:
             spatial_kernel_size: int = 2,
             nb_rot_kernels: int = 10,
             nb_rotations: int = 8,
-            nb_spatial_units: int = 50,
+            nb_spatial_units: List[int] = None,
             # nb_temporal_fcs: int = 50,
             nb_temporal_kernels: int = 3,
             first_temporal_kernel_size: int = 2,
@@ -35,9 +37,6 @@ class Config:
         super(Config).__init__()
 
         # generic configs
-        if experiment_names is not None and not isinstance(experiment_names, list):
-            experiment_names = [experiment_names]
-        self.experiment_names = experiment_names
         self.predictive_model = predictive_model
         self.grid_size = grid_size
         self.temporal_res = temporal_res
@@ -64,13 +63,11 @@ class Config:
         self.temporal_kernel_size = temporal_kernel_size
         self.nb_temporal_kernels = nb_temporal_kernels
 
-        self.nb_spatial_units = nb_spatial_units
-        # self.nb_temporal_fcs = nb_temporal_fcs
+        if nb_spatial_units is None:
+            self.nb_spatial_units = [50, 10, 3, 1]
+        else:
+            self.nb_spatial_units = nb_spatial_units
 
-        # if nb_temporal_units is None:
-        #     self.nb_temporal_units = [10, 10, 10]
-        # else:
-        #     self.nb_temporal_units = nb_temporal_units
         self.dropout = dropout
         self.layer_norm_eps = layer_norm_eps
 
@@ -80,6 +77,40 @@ class Config:
             self.data_file = pjoin(self.base_dir, 'python_processed', 'old_data_tres{:d}.h5'.format(temporal_res))
         else:
             self.data_file = data_file
+
+        if useful_cells is None:
+            self.useful_cells = self._load_cellinfo()
+        else:
+            self.useful_cells = useful_cells
+
+    def _load_cellinfo(self):
+        clu = pd.read_csv(pjoin(self.base_dir, "extra_info", "cellinfo.csv"))
+        ytu = pd.read_csv(pjoin(self.base_dir, "extra_info", "cellinfo_ytu.csv"))
+
+        clu = clu[np.logical_and(1 - clu.SingleElectrode, clu.HyperFlow)]
+        ytu = ytu[np.logical_and(1 - ytu.SingleElectrode, ytu.HyperFlow)]
+
+        useful_cells = {}
+
+        for name in clu.CellName:
+            useful_channels = []
+            for i in range(1, 16 + 1):
+                if clu[clu.CellName == name]["chan{:d}".format(i)].item():
+                    useful_channels.append(i - 1)
+
+            if len(useful_channels) > 1:
+                useful_cells.update({name: useful_channels})
+
+        for name in ytu.CellName:
+            useful_channels = []
+            for i in range(1, 24 + 1):
+                if ytu[ytu.CellName == name]["chan{:d}".format(i)].item():
+                    useful_channels.append(i - 1)
+
+            if len(useful_channels) > 1:
+                useful_cells.update({name: useful_channels})
+
+        return useful_cells
 
 
 class TrainConfig:

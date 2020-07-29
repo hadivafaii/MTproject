@@ -36,14 +36,15 @@ class MTTrainer:
             print("Using {:d} GPUs".format(torch.cuda.device_count()))
             self.model = nn.DataParallel(model)
             self.model = self.model.to(self.device)
+            self.config = self.model.module.config
         else:
             self.model = model.to(self.device)
+            self.config = model.config
 
         self.train_config = train_config
-        self.config = model.config
 
+        self.experiment_names = list(self.config.useful_cells.keys())
         self.dataset = None
-        self.experiment_names = []
         self.train_loader = None
         self._setup_data()
 
@@ -197,6 +198,8 @@ class MTTrainer:
                 desc2 = msg0 + msg1 + msg2
                 pbar.set_description(desc2)
 
+            if (global_step + 1) % self.train_config.log_freq == 0:
+                self.writer.add_scalar("tot_loss", final_loss.item(), global_step)
                 # TODO: add writer to print stuff during training
                 # self.writer.add_embedding(
                 #   self.model.get_word_embeddings(self.device),
@@ -272,21 +275,14 @@ class MTTrainer:
 
         t = PrettyTable(['Experiment Name', 'Channel', 'Train NNLL', 'Valid NNLL', 'Train R^2', 'Valid R^2'])
 
-        for expt in self.experiment_names:
-            if self.config.multicell:
-                if isinstance(self.model, nn.DataParallel):
-                    nb_cells = self.model.module.readout.nb_cells_dict[expt]
-                else:
-                    nb_cells = self.model.readout.nb_cells_dict[expt]
-            else:
-                nb_cells = 1
-            for cell in range(nb_cells):
+        for expt, good_channels in self.config.useful_cells.items():
+            for idx, cc in enumerate(good_channels):
                 t.add_row([
-                    expt, cell,
-                    np.round(train_nnll[expt][cell], 3),
-                    np.round(valid_nnll[expt][cell], 3),
-                    "{} {}".format(np.round(train_r2[expt][cell], 1), "%"),
-                    "{} {}".format(np.round(valid_r2[expt][cell], 1), "%"),
+                    expt, cc,
+                    np.round(train_nnll[expt][idx], 3),
+                    np.round(valid_nnll[expt][idx], 3),
+                    "{} {}".format(np.round(train_r2[expt][idx], 1), "%"),
+                    "{} {}".format(np.round(valid_r2[expt][idx], 1), "%"),
                 ])
 
         print(t)
@@ -344,14 +340,13 @@ class MTTrainer:
             raise ValueError("Invalid optimizer choice: {}".format(self.train_config.optim_chioce))
 
     def _setup_data(self):
-        dataset, experiment_names = create_datasets(self.config, self.train_config.xv_folds, self.rng)
+        dataset = create_datasets(self.config, self.train_config.xv_folds, self.rng)
         self.dataset = dataset
-        self.experiment_names = experiment_names
 
         self.train_loader = DataLoader(
             dataset=self.dataset,
             batch_size=self.train_config.batch_size,
-            drop_last=False,
+            drop_last=True,
         )
 
 

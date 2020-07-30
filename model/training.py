@@ -94,7 +94,7 @@ class MTTrainer:
 
         max_num_batches = len(dataloader)
         pbar = tqdm(enumerate(dataloader), total=max_num_batches)
-        for i, [src_dict, tgt_dict] in pbar:
+        for i, [src_dict, tgt_dict, _] in pbar:
             losses_dict = {}
             batch_data_dict = {expt: (src_dict[expt], tgt_dict[expt]) for expt in self.experiment_names}
 

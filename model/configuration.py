@@ -2,7 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 from os.path import join as pjoin
-from typing import List, Union, Dict
+from typing import List, Tuple, Union, Dict
 
 
 class Config:
@@ -18,15 +18,14 @@ class Config:
             nb_vel_tuning_units: List[int] = None,
             core_activation_fn: str = 'leaky_relu',
             readout_activation_fn: str = 'softplus',
-            rot_kernel_size: int = 2,
-            spatial_kernel_size: int = 2,
+            rot_kernel_size: Union[int, Tuple[int, int, int]] = 2,
+            conv_kernel_size: Union[int, Tuple[int, int, int]] = 2,
             nb_rot_kernels: int = 10,
             nb_rotations: int = 8,
+            nb_conv_units: List[int] = None,
             nb_spatial_units: List[int] = None,
-            # nb_temporal_fcs: int = 50,
-            nb_temporal_kernels: int = 3,
-            first_temporal_kernel_size: int = 2,
-            temporal_kernel_size: int = 2,
+            nb_temporal_units: List[int] = None,
+            # nb_temporal_kernels: int = 3,
             # nb_temporal_units: int = None,
             # nb_spatial_blocks: int = 3,
             dropout: float = 0.0,
@@ -54,19 +53,33 @@ class Config:
         # multicell or shared configs
         self.core_activation_fn = core_activation_fn
         self.readout_activation_fn = readout_activation_fn
-        self.rot_kernel_size = rot_kernel_size
-        self.spatial_kernel_size = spatial_kernel_size
+
+        if isinstance(rot_kernel_size, int):
+            self.rot_kernel_size = (rot_kernel_size,) * 3
+        else:
+            self.rot_kernel_size = rot_kernel_size
+        if isinstance(conv_kernel_size, int):
+            self.conv_kernel_size = (conv_kernel_size,) * 3
+        else:
+            self.conv_kernel_size = conv_kernel_size
+
         self.nb_rot_kernels = nb_rot_kernels
         self.nb_rotations = nb_rotations
 
-        self.first_temporal_kernel_size = first_temporal_kernel_size
-        self.temporal_kernel_size = temporal_kernel_size
-        self.nb_temporal_kernels = nb_temporal_kernels
-
+        if nb_conv_units is None:
+            self.nb_conv_units = [128, 128, 128]
+        else:
+            self.nb_conv_units = nb_conv_units
         if nb_spatial_units is None:
-            self.nb_spatial_units = [50, 10, 3, 1]
+            self.nb_spatial_units = [100, 20, 3, 1]
         else:
             self.nb_spatial_units = nb_spatial_units
+        if nb_temporal_units is None:
+            self.nb_temporal_units = [5, 2, 1, 1]
+        else:
+            self.nb_temporal_units = nb_temporal_units
+
+        assert len(self.nb_conv_units) + 1 == len(self.nb_spatial_units) == len(self.nb_temporal_units)
 
         self.dropout = dropout
         self.layer_norm_eps = layer_norm_eps

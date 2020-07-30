@@ -34,14 +34,17 @@ class MTDataset(Dataset):
         source = {
             expt: stim[..., self.train_indxs[expt][idx % self.lengths[expt]] - self.time_lags: self.train_indxs[expt][idx % self.lengths[expt]]] for
             (expt, stim) in self.stim.items()}
-        target = {
+        target_spks = {
             expt: spks[self.train_indxs[expt][idx % self.lengths[expt]]] for
             (expt, spks) in self.spks.items()}
+        target_stim = {
+            expt: stim[..., self.train_indxs[expt][idx % self.lengths[expt]]].flatten() for
+            (expt, stim) in self.stim.items()}
 
         if self.transform is not None:
             source = self.transform(source)
 
-        return source, target
+        return source, target_spks, target_stim
 
 
 def normalize_fn(x, dim=None):

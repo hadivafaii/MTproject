@@ -18,6 +18,7 @@ class Config:
             nb_vel_tuning_units: List[int] = None,
             core_activation_fn: str = 'leaky_relu',
             readout_activation_fn: str = 'softplus',
+            nb_levels: int = 3,
             rot_kernel_size: Union[int, Tuple[int, int, int]] = 2,
             conv_kernel_size: Union[int, Tuple[int, int, int]] = 2,
             nb_rot_kernels: int = 10,
@@ -53,6 +54,9 @@ class Config:
         # multicell or shared configs
         self.core_activation_fn = core_activation_fn
         self.readout_activation_fn = readout_activation_fn
+        self.nb_levels = nb_levels
+
+        assert self.nb_levels - 1 <= int(np.floor(np.log2(self.grid_size)))
 
         if isinstance(rot_kernel_size, int):
             self.rot_kernel_size = (rot_kernel_size,) * 3
@@ -67,19 +71,19 @@ class Config:
         self.nb_rotations = nb_rotations
 
         if nb_conv_units is None:
-            self.nb_conv_units = [128, 128, 128]
+            self.nb_conv_units = [128, 128, 128][:self.nb_levels - 1]
         else:
             self.nb_conv_units = nb_conv_units
         if nb_spatial_units is None:
-            self.nb_spatial_units = [100, 20, 3, 1]
+            self.nb_spatial_units = [50, 10, 3, 1][:self.nb_levels]
         else:
             self.nb_spatial_units = nb_spatial_units
         if nb_temporal_units is None:
-            self.nb_temporal_units = [5, 2, 1, 1]
+            self.nb_temporal_units = [2, 2, 1, 1][:self.nb_levels]
         else:
             self.nb_temporal_units = nb_temporal_units
 
-        assert len(self.nb_conv_units) + 1 == len(self.nb_spatial_units) == len(self.nb_temporal_units)
+        assert self.nb_levels == len(self.nb_conv_units) + 1 == len(self.nb_spatial_units) == len(self.nb_temporal_units)
 
         self.dropout = dropout
         self.layer_norm_eps = layer_norm_eps

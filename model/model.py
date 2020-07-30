@@ -299,9 +299,7 @@ class MTRotatioanlConvCoreNew(nn.Module):
             kernel_size=config.rot_kernel_size,
             padding=[k - 1 for k in config.rot_kernel_size])
 
-        self.nb_conv_channels = config.nb_rotations * config.nb_rot_kernels
-        self.nb_conv_layers = int(np.floor(np.log2(config.grid_size)))
-        self.nb_conv_units = [self.nb_conv_channels] + config.nb_conv_units
+        self.nb_conv_units = [config.nb_rotations * config.nb_rot_kernels] + config.nb_conv_units
 
         convs_list = []
         downsamples_list = []
@@ -309,7 +307,7 @@ class MTRotatioanlConvCoreNew(nn.Module):
         poolers_list = []
         spatial_fcs_list = [nn.Linear(config.grid_size ** 2, config.nb_spatial_units[0], bias=False)]
         temporal_fcs_list = [nn.Linear(config.time_lags, config.nb_temporal_units[0], bias=False)]
-        for i in range(1, self.nb_conv_layers + 1):
+        for i in range(1, config.nb_levels):
             in_channels = self.nb_conv_units[i-1]
             out_channels = self.nb_conv_units[i]
 
@@ -356,7 +354,7 @@ class MTRotatioanlConvCoreNew(nn.Module):
         x1 = x1.flatten(start_dim=1)  # N x C*nb_spatial_units[0]*nb_temporal_units[0]
         outputs_flat += (x1,)
 
-        for i in range(self.nb_conv_layers):
+        for i in range(self.config.nb_levels - 1):
             x_pool = self.poolers[i](outputs[i])
             x = self.chomp3d(self.convs[i](x_pool))
             res = x_pool if self.downsamples[i] is None else self.downsamples[i](x_pool)

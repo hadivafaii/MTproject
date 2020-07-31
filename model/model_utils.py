@@ -61,7 +61,7 @@ def load_model(model_id=-1, chkpt_id=-1, config=None, load_dir=None, verbose=Tru
         config = Config(**config_dict)
 
     if config.multicell:
-        loaded_model = MTNet(config)
+        loaded_model = MTNet(config, verbose=False)
     else:
         loaded_model = MTLayer(config)
     loaded_model.load_state_dict(torch.load(pjoin(load_dir, 'model.bin')))

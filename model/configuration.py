@@ -19,8 +19,9 @@ class Config:
             core_activation_fn: str = 'leaky_relu',
             readout_activation_fn: str = 'softplus',
             nb_levels: int = 3,
-            rot_kernel_size: Union[int, Tuple[int, int, int]] = 2,
-            conv_kernel_size: Union[int, Tuple[int, int, int]] = 2,
+            hidden_size: int = 32,
+            rot_kernel_size: Union[int, List[int]] = 2,
+            conv_kernel_size: Union[int, List[int]] = 2,
             nb_rot_kernels: int = 10,
             nb_rotations: int = 8,
             nb_conv_units: List[int] = None,
@@ -55,15 +56,16 @@ class Config:
         self.core_activation_fn = core_activation_fn
         self.readout_activation_fn = readout_activation_fn
         self.nb_levels = nb_levels
+        self.hidden_size = hidden_size
 
         assert self.nb_levels - 1 <= int(np.floor(np.log2(self.grid_size)))
 
         if isinstance(rot_kernel_size, int):
-            self.rot_kernel_size = (rot_kernel_size,) * 3
+            self.rot_kernel_size = [rot_kernel_size] * 3
         else:
             self.rot_kernel_size = rot_kernel_size
         if isinstance(conv_kernel_size, int):
-            self.conv_kernel_size = (conv_kernel_size,) * 3
+            self.conv_kernel_size = [conv_kernel_size] * 3
         else:
             self.conv_kernel_size = conv_kernel_size
 

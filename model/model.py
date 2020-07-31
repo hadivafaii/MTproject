@@ -24,7 +24,7 @@ class MTNet(nn.Module):
         self.config = config
 
         self.core = MTRotatioanlConvCoreNew(config, verbose=verbose)
-        self.readout = MTReadout(config, sum(self.core.output_sizes), verbose=verbose)
+        self.readout = MTReadout(config, verbose=verbose)
 
         # self.core = MTRotatioanlConvCore(config)
         # self.readout = MTReadout(config, self.core.output_size, verbose=verbose)
@@ -55,19 +55,17 @@ class MTNet(nn.Module):
 
 
 class MTReadout(nn.Module):
-    def __init__(self, config, hidden_size, verbose=True):
+    def __init__(self, config, verbose=True):
         super(MTReadout, self).__init__()
 
         self.config = config
-        self.hidden_size = hidden_size
-
-        self.norm = nn.LayerNorm(hidden_size, config.layer_norm_eps)
+        self.norm = nn.LayerNorm(config.hidden_size, config.layer_norm_eps)
 
         # TODO: idea, you can replace a linear layer with FF and some dim reduction:
         #  hidden_dim -> readout_dim (e.g. 80)
         layers = {}
         for expt, good_channels in config.useful_cells.items():
-            layers.update({expt: nn.Linear(hidden_size, len(good_channels), bias=True)})
+            layers.update({expt: nn.Linear(config.hidden_size, len(good_channels), bias=True)})
         self.layers = nn.ModuleDict(layers)
 
         self.activation = get_activation_fn(config.readout_activation_fn)
@@ -305,8 +303,8 @@ class MTRotatioanlConvCoreNew(nn.Module):
         downsamples_list = []
         dropouts_list = []
         poolers_list = []
-        spatial_fcs_list = [nn.Linear(config.grid_size ** 2, config.nb_spatial_units[0], bias=False)]
-        temporal_fcs_list = [nn.Linear(config.time_lags, config.nb_temporal_units[0], bias=False)]
+        spatial_fcs_list = [nn.Linear(config.grid_size ** 2, config.nb_spatial_units[0], bias=True)]
+        temporal_fcs_list = [nn.Linear(config.time_lags, config.nb_temporal_units[0], bias=True)]
         for i in range(1, config.nb_levels):
             in_channels = self.nb_conv_units[i-1]
             out_channels = self.nb_conv_units[i]
@@ -321,8 +319,8 @@ class MTRotatioanlConvCoreNew(nn.Module):
             dropouts_list.append(nn.Dropout(config.dropout))
             pool_size = [config.time_lags // (2 ** i), config.grid_size // (2 ** i), config.grid_size // (2 ** i)]
             poolers_list.append(nn.AdaptiveAvgPool3d(pool_size))
-            spatial_fcs_list.append(nn.Linear(np.prod(pool_size[1:]), config.nb_spatial_units[i], bias=False))
-            temporal_fcs_list.append(nn.Linear(pool_size[0], config.nb_temporal_units[i], bias=False))
+            spatial_fcs_list.append(nn.Linear(np.prod(pool_size[1:]), config.nb_spatial_units[i], bias=True))
+            temporal_fcs_list.append(nn.Linear(pool_size[0], config.nb_temporal_units[i], bias=True))
 
         self.convs = nn.ModuleList(convs_list)
         self.downsamples = nn.ModuleList(downsamples_list)
@@ -332,9 +330,12 @@ class MTRotatioanlConvCoreNew(nn.Module):
         self.temporal_fcs = nn.ModuleList(temporal_fcs_list)
 
         output_size_zip = zip(self.nb_conv_units, config.nb_spatial_units, config.nb_temporal_units)
-        self.output_sizes = [np.prod(tup) for tup in output_size_zip]
+        output_sizes = sum([np.prod(tup) for tup in output_size_zip])
+        self.fc = nn.Linear(output_sizes, config.hidden_size, bias=True)
+
         self.activation = get_activation_fn(config.core_activation_fn)
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout1 = nn.Dropout(config.dropout)
+        self.dropout2 = nn.Dropout(config.dropout)
         if verbose:
             print_num_params(self)
 
@@ -346,6 +347,7 @@ class MTRotatioanlConvCoreNew(nn.Module):
         x = x.permute(0, 1, 4, 2, 3)  # N x 2 x tau x grd x grd
         x = self.rot_chomp3d(self.rot_conv3d(x))  # N x C x tau x grd x grd
         x = self.activation(x)
+        x = self.dropout1(x)
         outputs += (x,)
 
         x1 = self.spatial_fcs[0](x.flatten(start_dim=3))  # N x C x tau x nb_spatial_units[0]
@@ -369,7 +371,10 @@ class MTRotatioanlConvCoreNew(nn.Module):
             outputs_flat += (x1,)
 
         x = torch.cat(outputs_flat, dim=-1)  # N x output_size
-        x = self.dropout(x)
+        x = self.activation(x)
+        x = self.dropout2(x)
+        x = self.fc(x)
+        x = self.activation(x)
 
         return x
 
@@ -550,16 +555,38 @@ class Chomp(nn.Module):
             self.chomp_sizes = chomp_sizes
 
         assert len(self.chomp_sizes) == nb_dims, "must enter a chomp size for each dim"
-
         self.nb_dims = nb_dims
 
     def forward(self, x):
+        input_size = x.size()
+
         if self.nb_dims == 1:
-            return x[:, :, :-self.chomp_sizes[0]].contiguous()
+            slice_d = slice(0, input_size[2] - self.chomp_sizes[0], 1)
+            return x[:, :, slice_d].contiguous()
+
         elif self.nb_dims == 2:
-            return x[:, :, :-self.chomp_sizes[0], :-self.chomp_sizes[1]].contiguous()
+            if self.chomp_sizes[0] % 2 == 0:
+                slice_h = slice(self.chomp_sizes[0] // 2, input_size[2] - self.chomp_sizes[0] // 2, 1)
+            else:
+                slice_h = slice(0, input_size[2] - self.chomp_sizes[0], 1)
+            if self.chomp_sizes[2] % 2 == 0:
+                slice_w = slice(self.chomp_sizes[1] // 2, input_size[3] - self.chomp_sizes[1] // 2, 1)
+            else:
+                slice_w = slice(0, input_size[3] - self.chomp_sizes[1], 1)
+            return x[:, :, slice_h, slice_w].contiguous()
+
         elif self.nb_dims == 3:
-            return x[:, :, :-self.chomp_sizes[0], :-self.chomp_sizes[1], :-self.chomp_sizes[2]].contiguous()
+            slice_d = slice(0, input_size[2] - self.chomp_sizes[0], 1)
+            if self.chomp_sizes[1] % 2 == 0:
+                slice_h = slice(self.chomp_sizes[1] // 2, input_size[3] - self.chomp_sizes[1] // 2, 1)
+            else:
+                slice_h = slice(0, input_size[3] - self.chomp_sizes[1], 1)
+            if self.chomp_sizes[2] % 2 == 0:
+                slice_w = slice(self.chomp_sizes[2] // 2, input_size[4] - self.chomp_sizes[2] // 2, 1)
+            else:
+                slice_w = slice(0, input_size[4] - self.chomp_sizes[2], 1)
+            return x[:, :, slice_d, slice_h, slice_w].contiguous()
+
         else:
             raise RuntimeError("Invalid number of dims")
 

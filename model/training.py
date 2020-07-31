@@ -286,18 +286,22 @@ class MTTrainer:
                 ])
 
         print(t)
-        print('avg train nnll: {:.4f}, r2: {:.2f} {}'.format(
-            np.mean([np.mean(item) for item in train_nnll.values()]),
-            np.mean([np.mean(item) for item in train_r2.values()]), '%'))
-        print('avg valid nnll: {:.4f}, r2: {:.2f} {} \n\n'.format(
-            np.mean([np.mean(item) for item in valid_nnll.values()]),
-            np.mean([np.mean(item) for item in valid_r2.values()]), '%'))
+
+        train_nnll_all = [x for item in train_nnll.values() for x in item]
+        train_r2_all = [x for item in train_r2.values() for x in item]
+        msg = 'train: \t avg nnll: {:.4f}, \t median nnll: {:.4f}, \t avg r2: {:.2f} {},'
+        print(msg.format(np.mean(train_nnll_all), np.median(train_nnll_all), np.mean(train_r2_all), '%'))
+
+        valid_nnll_all = [x for item in valid_nnll.values() for x in item]
+        valid_r2_all = [x for item in valid_r2.values() for x in item]
+        msg = 'valid: \t avg nnll: {:.4f}, \t median nnll: {:.4f}, \t avg r2: {:.2f} {},'
+        print(msg.format(np.mean(valid_nnll_all), np.median(valid_nnll_all), np.mean(valid_r2_all), '%'))
 
         output = {
             "train_preds_dict": train_preds_dict,
             "valid_preds_dict": valid_preds_dict,
             "train_nnll": train_nnll, "valid_nnll": valid_nnll,
-            "train_r2": train_r2, "valid_r2": valid_r2,
+            "train_nnll_all": train_nnll_all, "valid_nnll_all": valid_nnll_all,
         }
 
         return output
@@ -305,6 +309,7 @@ class MTTrainer:
     def swap_model(self, new_model):
         # TODO: does this need to be updated for DataParallel?
         self.model = new_model.to(self.device)
+        self.config = new_model.config
 
     def _setup_optim(self):
         if self.train_config.optim_choice == 'lamb':

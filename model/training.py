@@ -15,7 +15,7 @@ from tensorboardX import SummaryWriter
 
 from .dataset import create_datasets, normalize_fn
 from .optimizer import Lamb, log_lamb_rs, ScheduledOptim
-from .model_utils import save_model, compute_reg_loss, get_null_adj_nll
+from .model_utils import save_model, get_null_adj_nll
 
 import sys; sys.path.append('..')
 from utils.generic_utils import to_np, plot_vel_field
@@ -53,8 +53,6 @@ class MTTrainer:
         self.optim = None
         self.optim_schedule = None
         self._setup_optim()
-
-        print("\nTotal Parameters:", sum([p.nelement() for p in self.model.parameters()]))
 
     def train(self, nb_epochs, comment=None):
         assert isinstance(nb_epochs, (int, range)), "Please provide either range or int"
@@ -117,9 +115,9 @@ class MTTrainer:
                     pred = self.model(batch_src)
 
                 if isinstance(self.model, nn.DataParallel):
-                    loss = self.model.module.criterion(pred, batch_tgt)
+                    loss = self.model.module.criterion(pred, batch_tgt) / self.train_config.batch_size
                 else:
-                    loss = self.model.criterion(pred, batch_tgt)
+                    loss = self.model.criterion(pred, batch_tgt) / self.train_config.batch_size
 
                 if torch.isnan(loss).sum().item():
                     print("expt = {}. i = {}. nan encountered in loss. moving on".format(expt, i))
@@ -128,36 +126,30 @@ class MTTrainer:
                 losses_dict.update({expt: loss})
                 cuml_loss_dict[expt] += loss.item()
 
-                global_step = epoch * max_num_batches + i
-                if (global_step + 1) % self.train_config.log_freq == 0:
-                    # add losses to writerreinfor
-                    for k, v in losses_dict.items():
-                        self.writer.add_scalar("loss/{}".format(k), v.item(), global_step)
+            global_step = epoch * max_num_batches + i
+            if (global_step + 1) % self.train_config.log_freq == 0:
+                # add losses to writerreinfor
+                for k, v in losses_dict.items():
+                    self.writer.add_scalar("loss/{}".format(k), v.item(), global_step)
 
-                    # add optim state to writer
-                    if self.train_config.optim_choice == 'adam_with_warmup':
-                        self.writer.add_scalar('lr', self.optim_schedule.current_lr, global_step)
-                    else:
-                        log_lamb_rs(self.optim, self.writer, global_step)
+                # add optim state to writer
+                if self.train_config.optim_choice == 'adam_with_warmup':
+                    self.writer.add_scalar('lr', self.optim_schedule.current_lr, global_step)
+                elif self.train_config.optim_choice == 'lamb':
+                    log_lamb_rs(self.optim, self.writer, global_step)
 
             msg0 = 'epoch {:d}'.format(epoch)
             msg1 = ""
             for k, v in losses_dict.items():
                 msg1 += "{}: {:.3f}, ".format(k, v.item())
 
-            if self.config.multicell:
+            if self.config.regularization is None:
                 final_loss = sum(x for x in losses_dict.values()) / len(losses_dict)
                 msg1 += "tot: {:.3f}, ".format(final_loss.item())
 
             else:
-                reg_tensors = {
-                    'd2t': self.model.temporal_kernel.weight,
-                    'd2x': self.model.spatial_kernel.weight,
-                }
-                reg_losses_dict = compute_reg_loss(
-                    reg_vals=self.train_config.regularization,
-                    reg_mats=self.model.reg_mats_dict,
-                    tensors=reg_tensors)
+                reg_losses_dict = self.model.core.regularizer.compute_reg_loss(
+                    self.model.core.temporal_fcs, self.model.core.spatial_fcs)
 
                 global_step = epoch * max_num_batches + i
                 if (global_step + 1) % self.train_config.log_freq == 0:
@@ -191,10 +183,10 @@ class MTTrainer:
                 msg1 = ""
                 for k, v in cuml_loss_dict.items():
                     msg1 += "avg {}: {:.3f}, ".format(k, v / max_num_batches)
-                msg2 = " . . .  avg loss: {:.5f}, avg reg loss: {:.5f}"
+                msg2 = " . . .  avg loss: {:.5f}, avg reg loss: {:.2e}"
                 msg2 = msg2.format(
                     sum(cuml_loss_dict.values()) / max_num_batches / len(self.experiment_names),
-                    cuml_reg_loss / max_num_batches / len(self.train_config.regularization))
+                    cuml_reg_loss / max_num_batches)
                 desc2 = msg0 + msg1 + msg2
                 pbar.set_description(desc2)
 
@@ -258,39 +250,42 @@ class MTTrainer:
 
         return preds_dict
 
-    def evaluate_model(self):
-        train_preds_dict = self.generante_prediction(mode='train')
+    def evaluate_model(self, only_valid=True, print_table=False):
+        train_nnll, train_r2 = {}, {}
+        if not only_valid:
+            train_preds_dict = self.generante_prediction(mode='train')
+            for expt, (true, pred) in train_preds_dict.items():
+                train_nnll.update({expt: get_null_adj_nll(true, pred)})
+                train_r2.update({expt: r2_score(true, pred, multioutput='raw_values') * 100})
+        else:
+            train_preds_dict = {}
+
+        valid_nnll, valid_r2 = {}, {}
         valid_preds_dict = self.generante_prediction(mode='valid')
-
-        train_nnll, valid_nnll = {}, {}
-        train_r2, valid_r2 = {}, {}
-
-        for expt, (true, pred) in train_preds_dict.items():
-            train_nnll.update({expt: get_null_adj_nll(true, pred)})
-            train_r2.update({expt: r2_score(true, pred, multioutput='raw_values') * 100})
-
         for expt, (true, pred) in valid_preds_dict.items():
             valid_nnll.update({expt: get_null_adj_nll(true, pred)})
             valid_r2.update({expt: r2_score(true, pred, multioutput='raw_values') * 100})
 
-        t = PrettyTable(['Experiment Name', 'Channel', 'Train NNLL', 'Valid NNLL', 'Train R^2', 'Valid R^2'])
+        if print_table:
+            t = PrettyTable(['Experiment Name', 'Channel', 'Train NNLL', 'Valid NNLL', 'Train R^2', 'Valid R^2'])
 
-        for expt, good_channels in self.config.useful_cells.items():
-            for idx, cc in enumerate(good_channels):
-                t.add_row([
-                    expt, cc,
-                    np.round(train_nnll[expt][idx], 3),
-                    np.round(valid_nnll[expt][idx], 3),
-                    "{} {}".format(np.round(train_r2[expt][idx], 1), "%"),
-                    "{} {}".format(np.round(valid_r2[expt][idx], 1), "%"),
-                ])
+            for expt, good_channels in self.config.useful_cells.items():
+                for idx, cc in enumerate(good_channels):
+                    t.add_row([
+                        expt, cc,
+                        np.round(train_nnll[expt][idx], 3),
+                        np.round(valid_nnll[expt][idx], 3),
+                        "{} {}".format(np.round(train_r2[expt][idx], 1), "%"),
+                        "{} {}".format(np.round(valid_r2[expt][idx], 1), "%"),
+                    ])
 
-        print(t)
+            print(t)
 
         train_nnll_all = [x for item in train_nnll.values() for x in item]
         train_r2_all = [x for item in train_r2.values() for x in item]
-        msg = 'train: \t avg nnll: {:.4f}, \t median nnll: {:.4f}, \t avg r2: {:.2f} {},'
-        print(msg.format(np.mean(train_nnll_all), np.median(train_nnll_all), np.mean(train_r2_all), '%'))
+        if not only_valid:
+            msg = 'train: \t avg nnll: {:.4f}, \t median nnll: {:.4f}, \t avg r2: {:.2f} {},'
+            print(msg.format(np.mean(train_nnll_all), np.median(train_nnll_all), np.mean(train_r2_all), '%'))
 
         valid_nnll_all = [x for item in valid_nnll.values() for x in item]
         valid_r2_all = [x for item in valid_r2.values() for x in item]

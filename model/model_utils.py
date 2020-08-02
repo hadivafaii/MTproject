@@ -5,12 +5,85 @@ from copy import deepcopy as dc
 from prettytable import PrettyTable
 from os.path import join as pjoin
 import numpy as np
+from time import time
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .configuration import Config
+from .configuration import Config, TrainConfig
+from utils.generic_utils import convert_time
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+sns.set_style('dark')
+
+
+def run_eval_loop(loaded_models: dict, batch_size: int = 512, base_dir: str = None):
+    assert len(loaded_models) - 1 == max(list(loaded_models.keys())), "Not all models are loaded"
+
+    from .model import MTNet
+    from .training import MTTrainer
+
+    config = Config() if base_dir is None else Config(base_dir=base_dir)
+    base_trainer = MTTrainer(MTNet(config, verbose=False), TrainConfig(batch_size=batch_size))
+
+    mean_train_nnll = np.zeros(len(loaded_models))
+    mean_valid_nnll = np.zeros(len(loaded_models))
+    median_train_nnll = np.zeros(len(loaded_models))
+    median_valid_nnll = np.zeros(len(loaded_models))
+
+    start = time()
+
+    for chkpt, _model in sorted(loaded_models.items()):
+        print('\n\n\n')
+        print('-' * 40, "chkpt: {}".format(chkpt), '-' * 40)
+        base_trainer.swap_model(_model)
+        out_dict = base_trainer.evaluate_model()
+
+        mean_train_nnll[chkpt] = np.mean(out_dict['train_nnll_all']) if len(out_dict['train_nnll_all']) else 0
+        mean_valid_nnll[chkpt] = np.mean(out_dict['valid_nnll_all']) if len(out_dict['valid_nnll_all']) else 0
+        median_train_nnll[chkpt] = np.median(out_dict['train_nnll_all']) if len(out_dict['train_nnll_all']) else 0
+        median_valid_nnll[chkpt] = np.median(out_dict['valid_nnll_all']) if len(out_dict['valid_nnll_all']) else 0
+
+    end = time()
+
+    bst_mean_idx = np.argmax(mean_valid_nnll)
+    bst_median_idx = np.argmax(median_valid_nnll)
+
+    plt.figure(figsize=(16, 4))
+    plt.subplot(121)
+    plt.plot(mean_train_nnll, label="mean train")
+    plt.plot(mean_valid_nnll, label="mean valid")
+    plt.plot([bst_mean_idx, bst_mean_idx],
+             [min(min(mean_train_nnll), min(mean_valid_nnll)),
+              max(max(mean_train_nnll), max(mean_valid_nnll))],
+             ls='--', label="best idx: {}".format(bst_mean_idx))
+    plt.ylim(0.0, 0.2)
+    plt.legend()
+    plt.grid()
+
+    plt.subplot(122)
+    plt.plot(median_train_nnll, label="median train")
+    plt.plot(median_valid_nnll, label="median valid")
+    plt.plot([bst_median_idx, bst_median_idx],
+             [min(min(median_train_nnll), min(median_valid_nnll)),
+              max(max(median_train_nnll), max(median_valid_nnll))],
+             ls='--', label="best idx: {}".format(bst_mean_idx))
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    convert_time(end - start)
+
+    results = {
+        "mean_train_nnll": mean_train_nnll,
+        "mean_valid_nnll": mean_valid_nnll,
+        "median_train_nnll": median_train_nnll,
+        "median_valid_nnll": median_valid_nnll,
+    }
+
+    return base_trainer, results
 
 
 def save_model(model, prefix=None, comment=None):
@@ -39,7 +112,8 @@ def load_model(model_id=-1, chkpt_id=-1, config=None, load_dir=None, verbose=Tru
     from .model import MTLayer, MTNet
 
     if load_dir is None:
-        _dir = pjoin(os.environ['HOME'], 'Documents/MT/MT_LFP',  'saved_models')
+        # _dir = pjoin(os.environ['HOME'], 'Documents/MT/MT_LFP',  'saved_models')
+        _dir = pjoin(os.environ['HOME'], 'Documents/PROJECTS/MT_LFP', 'saved_models')
         available_models = os.listdir(_dir)
         if verbose:
             print('Available models to load:\n', available_models)
@@ -85,46 +159,6 @@ def print_num_params(module: nn.Module):
             else:
                 t.add_row([name, "{}".format(total_params)])
     print(t, '\n\n')
-
-
-def create_reg_mat(time_lags, spatial_dim):
-    temporal_mat = (
-            np.diag([1] * (time_lags - 1), k=-1) +
-            np.diag([-2] * time_lags, k=0) +
-            np.diag([1] * (time_lags - 1), k=1)
-    )
-
-    d1 = (
-            np.diag([1] * (spatial_dim - 1), k=-1) +
-            np.diag([-2] * spatial_dim, k=0) +
-            np.diag([1] * (spatial_dim - 1), k=1)
-    )
-    spatial_mat = np.kron(np.eye(spatial_dim), d1) + np.kron(d1, np.eye(spatial_dim))
-
-    reg_mats_dict = {
-        'd2t': torch.tensor(temporal_mat, dtype=torch.float),
-        'd2x': torch.tensor(spatial_mat, dtype=torch.float),
-    }
-
-    return reg_mats_dict
-
-
-def compute_reg_loss(reg_vals, reg_mats, tensors):
-    reg_losses = {}
-    for reg_type, reg_val in reg_vals.items():
-        w_size = tensors[reg_type].size()
-        if len(w_size) == 2:
-            w = tensors[reg_type]
-        elif len(w_size) == 4:
-            w = tensors[reg_type].flatten(end_dim=1).flatten(start_dim=1)
-        else:
-            raise RuntimeError("encountered tensor with size {}".format(w_size))
-
-        # TODO: add a try except here, so whenever tensor is None it just skips
-        loss = reg_val * ((w @ reg_mats[reg_type]) ** 2).sum()
-        reg_losses.update({reg_type: loss})
-
-    return reg_losses
 
 
 def _get_nll(true, pred):

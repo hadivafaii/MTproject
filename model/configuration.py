@@ -27,9 +27,7 @@ class Config:
             nb_conv_units: List[int] = None,
             nb_spatial_units: List[int] = None,
             nb_temporal_units: List[int] = None,
-            # nb_temporal_kernels: int = 3,
-            # nb_temporal_units: int = None,
-            # nb_spatial_blocks: int = 3,
+            regularization: Dict[str, float] = None,
             dropout: float = 0.0,
             layer_norm_eps: float = 1e-12,
             base_dir: str = 'Documents/PROJECTS/MT_LFP',
@@ -87,6 +85,7 @@ class Config:
 
         assert self.nb_levels == len(self.nb_conv_units) + 1 == len(self.nb_spatial_units) == len(self.nb_temporal_units)
 
+        self.regularization = regularization
         self.dropout = dropout
         self.layer_norm_eps = layer_norm_eps
 
@@ -136,7 +135,6 @@ class TrainConfig:
     def __init__(
             self,
             optim_choice='adam_with_warmup',
-            regularization: dict = None,
             lr=1e-3,
             betas=(0.9, 0.999),
             weight_decay: float = 0.01,
@@ -146,22 +144,13 @@ class TrainConfig:
             chkpt_freq: int = 10,
             batch_size: int = 1024,
             xv_folds: int = 5,
-            freeze_parameters_keywords: list = None,
             runs_dir: str = 'Documents/MT/runs',
     ):
         super(TrainConfig).__init__()
-
-        if regularization is None:
-            regularization = {'d2t': 1e-4, 'd2x': 1e-4}
-
-        if freeze_parameters_keywords is None:
-            freeze_parameters_keywords = []
-
         _allowed_optim_choices = ['lamb', 'adam', 'adam_with_warmup']
         assert optim_choice in _allowed_optim_choices, "Invalid optimzer choice, allowed options:\n{}".format(_allowed_optim_choices)
 
         self.optim_choice = optim_choice
-        self.regularization = regularization
         self.lr = lr
         self.betas = betas
         self.weight_decay = weight_decay
@@ -171,5 +160,4 @@ class TrainConfig:
         self.chkpt_freq = chkpt_freq
         self.batch_size = batch_size
         self.xv_folds = xv_folds
-        self.freeze_parameters_keywords = freeze_parameters_keywords
         self.runs_dir = pjoin(os.environ['HOME'], runs_dir)

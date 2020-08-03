@@ -36,7 +36,7 @@ def run_eval_loop(loaded_models: dict, batch_size: int = 512, base_dir: str = No
     start = time()
 
     for chkpt, _model in sorted(loaded_models.items()):
-        print('\n\n\n')
+        print('\n\n')
         print('-' * 40, "chkpt: {}".format(chkpt), '-' * 40)
         base_trainer.swap_model(_model)
         out_dict = base_trainer.evaluate_model()
@@ -108,20 +108,30 @@ def save_model(model, prefix=None, comment=None):
         yaml.dump(config_dict, f)
 
 
-def load_model(model_id=-1, chkpt_id=-1, config=None, load_dir=None, verbose=True):
+def load_model(keyword, chkpt_id=-1, config=None, verbose=False):
     from .model import MTLayer, MTNet
 
-    if load_dir is None:
-        # _dir = pjoin(os.environ['HOME'], 'Documents/MT/MT_LFP',  'saved_models')
-        _dir = pjoin(os.environ['HOME'], 'Documents/PROJECTS/MT_LFP', 'saved_models')
-        available_models = os.listdir(_dir)
-        if verbose:
-            print('Available models to load:\n', available_models)
-        model_dir = pjoin(_dir, available_models[model_id])
-        available_chkpts = os.listdir(model_dir)
-        if verbose:
-            print('\nAvailable chkpts to load:\n', available_chkpts)
-        load_dir = pjoin(model_dir, available_chkpts[chkpt_id])
+    _dir = pjoin(os.environ['HOME'], 'Documents/PROJECTS/MT_LFP',  'saved_models')
+    available_models = os.listdir(_dir)
+    if verbose:
+        print('Available models to load:\n', available_models)
+
+    match_found = False
+    model_id = -1
+    for i, model_name in enumerate(available_models):
+        if keyword in model_name:
+            model_id = i
+            match_found = True
+            break
+
+    if not match_found:
+        raise RuntimeError("no match found for keyword")
+
+    model_dir = pjoin(_dir, available_models[model_id])
+    available_chkpts = os.listdir(model_dir)
+    if verbose:
+        print('\nAvailable chkpts to load:\n', available_chkpts)
+    load_dir = pjoin(model_dir, available_chkpts[chkpt_id])
 
     if verbose:
         print('\nLoading from:\n{}\n'.format(load_dir))
@@ -135,9 +145,9 @@ def load_model(model_id=-1, chkpt_id=-1, config=None, load_dir=None, verbose=Tru
         config = Config(**config_dict)
 
     if config.multicell:
-        loaded_model = MTNet(config, verbose=False)
+        loaded_model = MTNet(config, verbose=verbose)
     else:
-        loaded_model = MTLayer(config)
+        loaded_model = MTLayer(config, verbose=verbose)
     loaded_model.load_state_dict(torch.load(pjoin(load_dir, 'model.bin')))
 
     chkpt = load_dir.split("/")[-1].split("_")[0]

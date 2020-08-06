@@ -81,206 +81,6 @@ class MTReadout(nn.Module):
         return y
 
 
-class MTRotationalDenseCore(nn.Module):
-    def __init__(self, config, verbose=True):
-        super(MTRotationalDenseCore, self).__init__()
-
-        self.config = config
-
-        self.chomp1 = Chomp(chomp_sizes=config.rot_kernel_size - 1, nb_dims=2)
-        self.chomp2 = Chomp(chomp_sizes=config.spatial_kernel_size - 1, nb_dims=2)
-
-        # 1st rotational spatio-temporal
-        self.temporal_fc = nn.Linear(config.time_lags, config.nb_temporal_kernels, bias=False)
-        self.rot_conv2d = weight_norm(RotConv2d(
-            in_channels=2,
-            out_channels=config.nb_rot_kernels,
-            nb_rotations=config.nb_rotations,
-            kernel_size=config.rot_kernel_size,
-            padding=config.rot_kernel_size - 1))
-
-        nb_rot_out_channels = config.nb_rotations * config.nb_rot_kernels * config.nb_temporal_kernels
-        self.nb_conv_layers = int(np.floor(np.log2(config.grid_size)))
-        self.nb_conv_units = [nb_rot_out_channels] + [128, 256, 512]
-
-        # deeper spatial part
-        convs_list = []
-        downsamples_list = []
-        dropouts_list = []
-        poolers_list = []
-        self.pad_sizes = []
-        for i in range(1, self.nb_conv_layers + 1):
-            in_channels = self.nb_conv_units[i-1]
-            out_channels = self.nb_conv_units[i]
-
-            convs_list.append(weight_norm(nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=config.spatial_kernel_size,
-                padding=config.spatial_kernel_size - 1)
-            ))
-            downsamples_list.append(nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else None)
-
-            dropouts_list.append(nn.Dropout(config.dropout))
-            pool_size = config.grid_size // (2 ** i)
-            poolers_list.append(nn.AdaptiveAvgPool2d(pool_size))
-            self.pad_sizes.append((config.grid_size - pool_size) // 2)
-
-        self.convs = nn.ModuleList(convs_list)
-        self.downsamples = nn.ModuleList(downsamples_list)
-        self.dropouts = nn.ModuleList(dropouts_list)
-        self.poolers = nn.ModuleList(poolers_list)
-
-        self.activation = get_activation_fn(config.core_activation_fn)
-        self.dropout = nn.Dropout(config.dropout)
-        if verbose:
-            print_num_params(self)
-
-    def forward(self, x):
-        outputs = ()
-        outputs_flat = ()
-
-        x = self._rot_st_fwd(x)
-        outputs += (x,)
-
-        x1 = x.flatten(start_dim=2)  # N x C0 x grd**2
-        outputs_flat += (x1,)
-
-        for i in range(self.nb_conv_layers):
-            x_pool = self.poolers[i](outputs[i])
-            x = self.chomp2(self.convs[i](x_pool))
-            res = x_pool if self.downsamples[i] is None else self.downsamples[i](x_pool)
-            x = self.activation(x + res)
-            x = self.dropouts[i](x)
-            outputs += (x,)
-
-            x1 = F.pad(x, (self.pad_sizes[i],) * 4)
-            x1 = x1.flatten(start_dim=2)
-            outputs_flat += (x1,)
-
-        x = torch.cat(outputs_flat, dim=1)  # N x C x grd**2
-        x = self.activation(x)
-
-        return x
-
-    def _rot_st_fwd(self, x):
-        # temporal part
-        x = self.temporal_fc(x)  # N x 2 x grd x grd x nb_temp_kernels
-        x = x.permute(0, -1, 1, 2, 3)  # N x nb_temp_kernels x 2 x grd x grd
-
-        # spatial part
-        x = x.flatten(end_dim=1)  # N * nb_temp_ch x 2 x grd x grd
-        x = self.chomp1(self.rot_conv2d(x))  # N * nb_temp_ch x nb_rot * nb_rot_kers x grd x grd
-        x = x.view(
-             -1, self.config.nb_temporal_kernels,
-             self.config.nb_rotations * self.config.nb_rot_kernels,
-             self.config.grid_size, self.config.grid_size)  # N x nb_temp_ch x nb_rot * nb_rot_kers x grd x grd
-        x = x.flatten(start_dim=1, end_dim=2)  # N x C x grd x grd
-
-        return self.activation(x)
-
-
-class MTRotatioanlConvCore(nn.Module):
-    def __init__(self, config):
-        super(MTRotatioanlConvCore, self).__init__()
-
-        config.nb_temporal_kernels = 2
-        self.config = config
-
-        self.chomp1 = Chomp(chomp_sizes=config.rot_kernel_size - 1, nb_dims=2)
-        self.chomp2 = Chomp(chomp_sizes=config.spatial_kernel_size - 1, nb_dims=2)
-
-        # 1st rotational spatio-temporal
-        self.temporal_fc = nn.Linear(config.time_lags, config.nb_temporal_kernels, bias=False)
-        self.rot_conv2d = weight_norm(RotConv2d(
-            in_channels=2,
-            out_channels=config.nb_rot_kernels,
-            nb_rotations=config.nb_rotations,
-            kernel_size=config.rot_kernel_size,
-            padding=config.rot_kernel_size - 1))
-
-        self.nb_rot_out_channels = config.nb_rotations * config.nb_rot_kernels * config.nb_temporal_kernels
-        self.nb_conv_layers = int(np.floor(np.log2(config.grid_size)))
-        self.nb_conv_units = [self.nb_rot_out_channels] * 4
-        # self.nb_conv_units = [self.nb_rot_out_channels] + [64, 64, 64]
-
-        # deeper spatial part
-        convs_list = []
-        downsamples_list = []
-        dropouts_list = []
-        poolers_list = []
-        spatial_fcs_list = [nn.Linear(config.grid_size ** 2, config.nb_spatial_units[0], bias=False)]
-        for i in range(1, self.nb_conv_layers + 1):
-            in_channels = self.nb_conv_units[i-1]
-            out_channels = self.nb_conv_units[i]
-
-            convs_list.append(weight_norm(nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=config.spatial_kernel_size,
-                padding=config.spatial_kernel_size - 1)
-            ))
-            downsamples_list.append(nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else None)
-
-            dropouts_list.append(nn.Dropout(config.dropout))
-            pool_size = config.grid_size // (2 ** i)
-            poolers_list.append(nn.AdaptiveAvgPool2d(pool_size))
-            spatial_fcs_list.append(nn.Linear(pool_size ** 2, config.nb_spatial_units[i], bias=False))
-
-        self.convs = nn.ModuleList(convs_list)
-        self.downsamples = nn.ModuleList(downsamples_list)
-        self.dropouts = nn.ModuleList(dropouts_list)
-        self.poolers = nn.ModuleList(poolers_list)
-        self.spatial_fcs = nn.ModuleList(spatial_fcs_list)
-
-        self.output_size = sum([np.prod(tup) for tup in zip(self.nb_conv_units, config.nb_spatial_units)])
-        self.activation = get_activation_fn(config.core_activation_fn)
-        self.dropout = nn.Dropout(config.dropout)
-        print_num_params(self)
-
-    def forward(self, x):
-        outputs = ()
-        outputs_flat = ()
-
-        x = self._rot_st_fwd(x)
-        outputs += (x,)
-
-        x1 = self.spatial_fcs[0](x.flatten(start_dim=2)).flatten(start_dim=1)
-        outputs_flat += (x1,)
-
-        for i in range(self.nb_conv_layers):
-            x_pool = self.poolers[i](outputs[i])
-            x = self.chomp2(self.convs[i](x_pool))
-            res = x_pool if self.downsamples[i] is None else self.downsamples[i](x_pool)
-            x = self.activation(x + res)
-            x = self.dropouts[i](x)
-            outputs += (x,)
-
-            x1 = self.spatial_fcs[i+1](x.flatten(start_dim=2)).flatten(start_dim=1)
-            outputs_flat += (x1,)
-
-        x = torch.cat(outputs_flat, dim=-1)
-        # x = self.activation(x)
-
-        return x
-
-    def _rot_st_fwd(self, x):
-        # temporal part
-        x = self.temporal_fc(x)  # N x 2 x grd x grd x nb_temp_kernels
-        x = x.permute(0, -1, 1, 2, 3)  # N x nb_temp_kernels x 2 x grd x grd
-
-        # spatial part
-        x = x.flatten(end_dim=1)  # N * nb_temp_ch x 2 x grd x grd
-        x = self.chomp1(self.rot_conv2d(x))  # N * nb_temp_ch x nb_rot * nb_rot_kers x grd x grd
-        x = x.view(
-             -1, self.config.nb_temporal_kernels,
-             self.config.nb_rotations * self.config.nb_rot_kernels,
-             self.config.grid_size, self.config.grid_size)  # N x nb_temp_ch x nb_rot * nb_rot_kers x grd x grd
-        x = x.flatten(start_dim=1, end_dim=2)  # N x C x grd x grd
-
-        return self.activation(x)
-
-
 class MTRotatioanlConvCoreNew(nn.Module):
     def __init__(self, config, verbose=True):
         super(MTRotatioanlConvCoreNew, self).__init__()
@@ -301,6 +101,7 @@ class MTRotatioanlConvCoreNew(nn.Module):
 
         convs_list = []
         downsamples_list = []
+        activations_list = []
         dropouts_list = []
         poolers_list = []
         spatial_fcs_list = [nn.Linear(config.grid_size ** 2, config.nb_spatial_units[0], bias=True)]
@@ -317,6 +118,7 @@ class MTRotatioanlConvCoreNew(nn.Module):
                 kernel_size=config.conv_kernel_size,
                 padding=[k - 1 for k in config.conv_kernel_size]))
             downsamples_list.append(nn.Conv3d(in_channels, out_channels, 1) if in_channels != out_channels else None)
+            activations_list.append(nn.LeakyReLU(negative_slope=config.leaky_negative_slope))
 
             dropouts_list.append(nn.Dropout(config.dropout))
             pool_size = [config.time_lags // (2 ** i), config.grid_size // (2 ** i), config.grid_size // (2 ** i)]
@@ -332,6 +134,7 @@ class MTRotatioanlConvCoreNew(nn.Module):
         self.poolers = nn.ModuleList(poolers_list)
         self.spatial_fcs = nn.ModuleList(spatial_fcs_list)
         self.temporal_fcs = nn.ModuleList(temporal_fcs_list)
+        self.activations = nn.ModuleList(activations_list)
 
         if config.regularization is not None:
             self.regularizer = Regularizer(
@@ -343,7 +146,9 @@ class MTRotatioanlConvCoreNew(nn.Module):
         output_sizes = sum([np.prod(tup) for tup in output_size_zip])
         self.fc = nn.Linear(output_sizes, config.hidden_size, bias=True)
 
-        self.activation = get_activation_fn(config.core_activation_fn)
+        self.leaky_relu1 = nn.LeakyReLU(negative_slope=config.leaky_negative_slope)
+        self.leaky_relu2 = nn.LeakyReLU(negative_slope=config.leaky_negative_slope)
+        self.leaky_relu3 = nn.LeakyReLU(negative_slope=config.leaky_negative_slope)
         self.dropout1 = nn.Dropout(config.dropout)
         self.dropout2 = nn.Dropout(config.dropout)
         if verbose:
@@ -356,7 +161,7 @@ class MTRotatioanlConvCoreNew(nn.Module):
         # x = self._rot_fwd(x)
         x = x.permute(0, 1, 4, 2, 3)  # N x 2 x tau x grd x grd
         x = self.rot_chomp3d(self.rot_conv3d(x))  # N x C x tau x grd x grd
-        x = self.activation(x)
+        x = self.leaky_relu1(x)
         x = self.dropout1(x)
         outputs += (x,)
 
@@ -370,7 +175,7 @@ class MTRotatioanlConvCoreNew(nn.Module):
             x_pool = self.poolers[i](outputs[i])
             x = self.chomp3d(self.convs[i](x_pool))
             res = x_pool if self.downsamples[i] is None else self.downsamples[i](x_pool)
-            x = self.activation(x + res)
+            x = self.activations[i](x + res)
             x = self.dropouts[i](x)
             outputs += (x,)
 
@@ -381,10 +186,10 @@ class MTRotatioanlConvCoreNew(nn.Module):
             outputs_flat += (x1,)
 
         x = torch.cat(outputs_flat, dim=-1)  # N x output_size
-        x = self.activation(x)
+        x = self.leaky_relu2(x)
         x = self.dropout2(x)
         x = self.fc(x)
-        x = self.activation(x)
+        x = self.leaky_relu3(x)
 
         return x
 
@@ -614,6 +419,206 @@ class RotConv2d(nn.Conv2d):
         w = torch.einsum('jkn, inlm -> ijklm', self.rotation_mat, self.weight)
         w = w.flatten(end_dim=1)
         return w
+
+
+class MTRotationalDenseCore(nn.Module):
+    def __init__(self, config, verbose=True):
+        super(MTRotationalDenseCore, self).__init__()
+
+        self.config = config
+
+        self.chomp1 = Chomp(chomp_sizes=config.rot_kernel_size - 1, nb_dims=2)
+        self.chomp2 = Chomp(chomp_sizes=config.spatial_kernel_size - 1, nb_dims=2)
+
+        # 1st rotational spatio-temporal
+        self.temporal_fc = nn.Linear(config.time_lags, config.nb_temporal_kernels, bias=False)
+        self.rot_conv2d = weight_norm(RotConv2d(
+            in_channels=2,
+            out_channels=config.nb_rot_kernels,
+            nb_rotations=config.nb_rotations,
+            kernel_size=config.rot_kernel_size,
+            padding=config.rot_kernel_size - 1))
+
+        nb_rot_out_channels = config.nb_rotations * config.nb_rot_kernels * config.nb_temporal_kernels
+        self.nb_conv_layers = int(np.floor(np.log2(config.grid_size)))
+        self.nb_conv_units = [nb_rot_out_channels] + [128, 256, 512]
+
+        # deeper spatial part
+        convs_list = []
+        downsamples_list = []
+        dropouts_list = []
+        poolers_list = []
+        self.pad_sizes = []
+        for i in range(1, self.nb_conv_layers + 1):
+            in_channels = self.nb_conv_units[i-1]
+            out_channels = self.nb_conv_units[i]
+
+            convs_list.append(weight_norm(nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=config.spatial_kernel_size,
+                padding=config.spatial_kernel_size - 1)
+            ))
+            downsamples_list.append(nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else None)
+
+            dropouts_list.append(nn.Dropout(config.dropout))
+            pool_size = config.grid_size // (2 ** i)
+            poolers_list.append(nn.AdaptiveAvgPool2d(pool_size))
+            self.pad_sizes.append((config.grid_size - pool_size) // 2)
+
+        self.convs = nn.ModuleList(convs_list)
+        self.downsamples = nn.ModuleList(downsamples_list)
+        self.dropouts = nn.ModuleList(dropouts_list)
+        self.poolers = nn.ModuleList(poolers_list)
+
+        self.activation = get_activation_fn(config.core_activation_fn)
+        self.dropout = nn.Dropout(config.dropout)
+        if verbose:
+            print_num_params(self)
+
+    def forward(self, x):
+        outputs = ()
+        outputs_flat = ()
+
+        x = self._rot_st_fwd(x)
+        outputs += (x,)
+
+        x1 = x.flatten(start_dim=2)  # N x C0 x grd**2
+        outputs_flat += (x1,)
+
+        for i in range(self.nb_conv_layers):
+            x_pool = self.poolers[i](outputs[i])
+            x = self.chomp2(self.convs[i](x_pool))
+            res = x_pool if self.downsamples[i] is None else self.downsamples[i](x_pool)
+            x = self.activation(x + res)
+            x = self.dropouts[i](x)
+            outputs += (x,)
+
+            x1 = F.pad(x, (self.pad_sizes[i],) * 4)
+            x1 = x1.flatten(start_dim=2)
+            outputs_flat += (x1,)
+
+        x = torch.cat(outputs_flat, dim=1)  # N x C x grd**2
+        x = self.activation(x)
+
+        return x
+
+    def _rot_st_fwd(self, x):
+        # temporal part
+        x = self.temporal_fc(x)  # N x 2 x grd x grd x nb_temp_kernels
+        x = x.permute(0, -1, 1, 2, 3)  # N x nb_temp_kernels x 2 x grd x grd
+
+        # spatial part
+        x = x.flatten(end_dim=1)  # N * nb_temp_ch x 2 x grd x grd
+        x = self.chomp1(self.rot_conv2d(x))  # N * nb_temp_ch x nb_rot * nb_rot_kers x grd x grd
+        x = x.view(
+             -1, self.config.nb_temporal_kernels,
+             self.config.nb_rotations * self.config.nb_rot_kernels,
+             self.config.grid_size, self.config.grid_size)  # N x nb_temp_ch x nb_rot * nb_rot_kers x grd x grd
+        x = x.flatten(start_dim=1, end_dim=2)  # N x C x grd x grd
+
+        return self.activation(x)
+
+
+class MTRotatioanlConvCore(nn.Module):
+    def __init__(self, config):
+        super(MTRotatioanlConvCore, self).__init__()
+
+        config.nb_temporal_kernels = 2
+        self.config = config
+
+        self.chomp1 = Chomp(chomp_sizes=config.rot_kernel_size - 1, nb_dims=2)
+        self.chomp2 = Chomp(chomp_sizes=config.spatial_kernel_size - 1, nb_dims=2)
+
+        # 1st rotational spatio-temporal
+        self.temporal_fc = nn.Linear(config.time_lags, config.nb_temporal_kernels, bias=False)
+        self.rot_conv2d = weight_norm(RotConv2d(
+            in_channels=2,
+            out_channels=config.nb_rot_kernels,
+            nb_rotations=config.nb_rotations,
+            kernel_size=config.rot_kernel_size,
+            padding=config.rot_kernel_size - 1))
+
+        self.nb_rot_out_channels = config.nb_rotations * config.nb_rot_kernels * config.nb_temporal_kernels
+        self.nb_conv_layers = int(np.floor(np.log2(config.grid_size)))
+        self.nb_conv_units = [self.nb_rot_out_channels] * 4
+        # self.nb_conv_units = [self.nb_rot_out_channels] + [64, 64, 64]
+
+        # deeper spatial part
+        convs_list = []
+        downsamples_list = []
+        dropouts_list = []
+        poolers_list = []
+        spatial_fcs_list = [nn.Linear(config.grid_size ** 2, config.nb_spatial_units[0], bias=False)]
+        for i in range(1, self.nb_conv_layers + 1):
+            in_channels = self.nb_conv_units[i-1]
+            out_channels = self.nb_conv_units[i]
+
+            convs_list.append(weight_norm(nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=config.spatial_kernel_size,
+                padding=config.spatial_kernel_size - 1)
+            ))
+            downsamples_list.append(nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else None)
+
+            dropouts_list.append(nn.Dropout(config.dropout))
+            pool_size = config.grid_size // (2 ** i)
+            poolers_list.append(nn.AdaptiveAvgPool2d(pool_size))
+            spatial_fcs_list.append(nn.Linear(pool_size ** 2, config.nb_spatial_units[i], bias=False))
+
+        self.convs = nn.ModuleList(convs_list)
+        self.downsamples = nn.ModuleList(downsamples_list)
+        self.dropouts = nn.ModuleList(dropouts_list)
+        self.poolers = nn.ModuleList(poolers_list)
+        self.spatial_fcs = nn.ModuleList(spatial_fcs_list)
+
+        self.output_size = sum([np.prod(tup) for tup in zip(self.nb_conv_units, config.nb_spatial_units)])
+        self.activation = get_activation_fn(config.core_activation_fn)
+        self.dropout = nn.Dropout(config.dropout)
+        print_num_params(self)
+
+    def forward(self, x):
+        outputs = ()
+        outputs_flat = ()
+
+        x = self._rot_st_fwd(x)
+        outputs += (x,)
+
+        x1 = self.spatial_fcs[0](x.flatten(start_dim=2)).flatten(start_dim=1)
+        outputs_flat += (x1,)
+
+        for i in range(self.nb_conv_layers):
+            x_pool = self.poolers[i](outputs[i])
+            x = self.chomp2(self.convs[i](x_pool))
+            res = x_pool if self.downsamples[i] is None else self.downsamples[i](x_pool)
+            x = self.activation(x + res)
+            x = self.dropouts[i](x)
+            outputs += (x,)
+
+            x1 = self.spatial_fcs[i+1](x.flatten(start_dim=2)).flatten(start_dim=1)
+            outputs_flat += (x1,)
+
+        x = torch.cat(outputs_flat, dim=-1)
+        # x = self.activation(x)
+
+        return x
+
+    def _rot_st_fwd(self, x):
+        # temporal part
+        x = self.temporal_fc(x)  # N x 2 x grd x grd x nb_temp_kernels
+        x = x.permute(0, -1, 1, 2, 3)  # N x nb_temp_kernels x 2 x grd x grd
+
+        # spatial part
+        x = x.flatten(end_dim=1)  # N * nb_temp_ch x 2 x grd x grd
+        x = self.chomp1(self.rot_conv2d(x))  # N * nb_temp_ch x nb_rot * nb_rot_kers x grd x grd
+        x = x.view(
+             -1, self.config.nb_temporal_kernels,
+             self.config.nb_rotations * self.config.nb_rot_kernels,
+             self.config.grid_size, self.config.grid_size)  # N x nb_temp_ch x nb_rot * nb_rot_kers x grd x grd
+        x = x.flatten(start_dim=1, end_dim=2)  # N x C x grd x grd
+
+        return self.activation(x)
 
 
 class TemporalBlock(nn.Module):

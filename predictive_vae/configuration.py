@@ -9,26 +9,27 @@ class Config:
     def __init__(
         self,
             useful_cells: Dict[str, list] = None,
-            predictive_model: bool = False,
             grid_size: int = 15,
+            decoder_init_grid_size: int = 3,
             temporal_res: int = 25,
-            time_lags: int = 40,
+            time_lags: int = 20,
             initializer_range: float = 0.01,
-            multicell: bool = True,
-            nb_vel_tuning_units: List[int] = None,
             leaky_negative_slope: float = 0.2,
             readout_activation_fn: str = 'softplus',
-            nb_levels: int = 3,
-            hidden_size: int = 32,
+            beta: float = 1.0,
+            hidden_size: int = 64,
             rot_kernel_size: Union[int, List[int]] = 2,
             conv_kernel_size: Union[int, List[int]] = 2,
-            nb_rot_kernels: int = 10,
+            nb_rot_kernels: int = 16,
             nb_rotations: int = 8,
             nb_conv_units: List[int] = None,
             nb_spatial_units: List[int] = None,
             nb_temporal_units: List[int] = None,
+            nb_decoder_units: List[int] = None,
+            decoder_kernel_sizes: List[int] = None,
+            decoder_strides: List[int] = None,
             regularization: Dict[str, float] = None,
-            dropout: float = 0.0,
+            dropout: float = 0.5,
             layer_norm_eps: float = 1e-12,
             base_dir: str = 'Documents/PROJECTS/MT_LFP',
             data_file: str = None,
@@ -36,27 +37,17 @@ class Config:
         super(Config).__init__()
 
         # generic configs
-        self.predictive_model = predictive_model
         self.grid_size = grid_size
+        self.decoder_init_grid_size = decoder_init_grid_size
         self.temporal_res = temporal_res
         self.time_lags = time_lags
         self.initializer_range = initializer_range
-
-        self.multicell = multicell
-
-        # single cell configs
-        if nb_vel_tuning_units is None:
-            self.nb_vel_tuning_units = [10, 10, 10, 10, 10]
-        else:
-            self.nb_vel_tuning_units = nb_vel_tuning_units
-
-        # multicell or shared configs
         self.leaky_negative_slope = leaky_negative_slope
         self.readout_activation_fn = readout_activation_fn
-        self.nb_levels = nb_levels
+        self.beta = beta
         self.hidden_size = hidden_size
 
-        assert self.nb_levels - 1 <= int(np.floor(np.log2(self.grid_size)))
+        # encoder
 
         if isinstance(rot_kernel_size, int):
             self.rot_kernel_size = [rot_kernel_size] * 3
@@ -71,19 +62,39 @@ class Config:
         self.nb_rotations = nb_rotations
 
         if nb_conv_units is None:
-            self.nb_conv_units = [128, 128, 128][:self.nb_levels - 1]
+            self.nb_conv_units = [256, 512]
         else:
             self.nb_conv_units = nb_conv_units
         if nb_spatial_units is None:
-            self.nb_spatial_units = [50, 10, 3, 1][:self.nb_levels]
+            self.nb_spatial_units = [128, 8, 2]
         else:
             self.nb_spatial_units = nb_spatial_units
         if nb_temporal_units is None:
-            self.nb_temporal_units = [2, 2, 1, 1][:self.nb_levels]
+            self.nb_temporal_units = [2, 2, 1]
         else:
             self.nb_temporal_units = nb_temporal_units
 
-        assert self.nb_levels == len(self.nb_conv_units) + 1 == len(self.nb_spatial_units) == len(self.nb_temporal_units)
+        assert len(self.nb_spatial_units) == len(self.nb_temporal_units) == \
+               len(self.nb_conv_units) + 1 <= int(np.floor(np.log2(self.grid_size))) + 1
+
+        # decoder
+        if nb_decoder_units is None:
+            self.nb_decoder_units = [256, 128, 64, 2]
+        else:
+            self.nb_decoder_units = nb_decoder_units
+        if decoder_kernel_sizes is None:
+            self.decoder_kernel_sizes = [3, 3, 1]
+        else:
+            self.decoder_kernel_sizes = decoder_kernel_sizes
+        if decoder_strides is None:
+            self.decoder_strides = [2, 2, 1]
+        else:
+            self.decoder_strides = decoder_strides
+
+        assert self.nb_decoder_units[-1] == 2, "must reproduce a vel field with two channels"
+        assert len(self.nb_decoder_units) - 1 == \
+               len(self.decoder_kernel_sizes) == \
+               len(self.decoder_strides)
 
         self.regularization = regularization
         self.dropout = dropout
@@ -141,8 +152,8 @@ class TrainConfig:
             warmup_steps: int = 1000,
             use_cuda: bool = True,
             log_freq: int = 10,
-            chkpt_freq: int = 10,
-            batch_size: int = 1024,
+            chkpt_freq: int = 1,
+            batch_size: int = 768,
             xv_folds: int = 5,
             runs_dir: str = 'Documents/MT/runs',
     ):

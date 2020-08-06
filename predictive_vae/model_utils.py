@@ -109,7 +109,7 @@ def save_model(model, prefix=None, comment=None):
 
 
 def load_model(keyword, chkpt_id=-1, config=None, verbose=False):
-    from .model import MTLayer, MTNet
+    from .model import PredictiveVAE
 
     _dir = pjoin(os.environ['HOME'], 'Documents/PROJECTS/MT_LFP',  'saved_models')
     available_models = os.listdir(_dir)
@@ -144,10 +144,7 @@ def load_model(keyword, chkpt_id=-1, config=None, verbose=False):
                 print(exc)
         config = Config(**config_dict)
 
-    if config.multicell:
-        loaded_model = MTNet(config, verbose=verbose)
-    else:
-        loaded_model = MTLayer(config, verbose=verbose)
+    loaded_model = PredictiveVAE(config, verbose=verbose)
     loaded_model.load_state_dict(torch.load(pjoin(load_dir, 'model.bin')))
 
     chkpt = load_dir.split("/")[-1].split("_")[0]

@@ -9,7 +9,8 @@ from copy import deepcopy as dc
 
 import torch
 from torch import nn
-from torch.optim import Adam
+from torch.optim import Adam, Adamax
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 
@@ -141,6 +142,9 @@ class Trainer:
                 desc2 = msg0 + msg1
                 pbar.set_description(desc2)
 
+        if self.train_config.optim_choice == 'adamax':
+            self.optim_schedule.step()
+
     def swap_model(self, new_model):
         self.model = new_model.to(self.device)
         self.config = new_model.config
@@ -162,6 +166,15 @@ class Trainer:
                 betas=self.train_config.betas,
                 weight_decay=self.train_config.weight_decay,
             )
+
+        elif self.train_config.optim_choice == 'adamax':
+            self.optim = Adamax(
+                filter(lambda p: p.requires_grad, self.model.parameters()),
+                lr=self.train_config.lr,
+                betas=self.train_config.betas,
+                weight_decay=self.train_config.weight_decay,
+            )
+            self.optim_schedule = CosineAnnealingLR(self.optim, T_max=20, eta_min=1e-6)
 
         elif self.train_config.optim_choice == 'adam_with_warmup':
             self.optim = Adam(

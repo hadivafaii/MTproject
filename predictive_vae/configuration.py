@@ -153,12 +153,13 @@ class TrainConfig:
             use_cuda: bool = True,
             log_freq: int = 10,
             chkpt_freq: int = 1,
+            # scheduler_step_freq: int = 5000,
             batch_size: int = 768,
             xv_folds: int = 5,
             runs_dir: str = 'Documents/MT/runs',
     ):
         super(TrainConfig).__init__()
-        _allowed_optim_choices = ['lamb', 'adam', 'adam_with_warmup']
+        _allowed_optim_choices = ['lamb', 'adam', 'adam_with_warmup', 'adamax']
         assert optim_choice in _allowed_optim_choices, "Invalid optimzer choice, allowed options:\n{}".format(_allowed_optim_choices)
 
         self.optim_choice = optim_choice
@@ -169,6 +170,7 @@ class TrainConfig:
         self.use_cuda = use_cuda
         self.log_freq = log_freq
         self.chkpt_freq = chkpt_freq
+        # self.scheduler_step_freq = scheduler_step_freq
         self.batch_size = batch_size
         self.xv_folds = xv_folds
         self.runs_dir = pjoin(os.environ['HOME'], runs_dir)

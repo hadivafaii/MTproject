@@ -1,5 +1,7 @@
 import os
+import torch
 import numpy as np
+from copy import deepcopy as dc
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import seaborn as sns
@@ -23,6 +25,9 @@ def convert_time(time_in_secs):
 
 
 def plot_vel_field(data, fig_size=None, scale=None, save_file=None, estimate_center=False):
+    if torch.is_tensor(data):
+        data = to_np(dc(data))
+
     grd = data.shape[1]
     xx, yy = np.mgrid[0:grd, 0:grd]
 

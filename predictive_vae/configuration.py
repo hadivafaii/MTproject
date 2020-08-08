@@ -15,9 +15,10 @@ class Config:
             time_lags: int = 20,
             initializer_range: float = 0.01,
             leaky_negative_slope: float = 0.2,
-            readout_activation_fn: str = 'softplus',
-            beta: float = 1.0,
-            hidden_size: int = 64,
+            beta_range: Tuple[float, float] = (0.0, 1.0),
+            beta_warmup_steps: int = 5000,
+            hidden_size: int = 128,
+            rnn_hidden_size: int = 64,
             rot_kernel_size: Union[int, List[int]] = 2,
             conv_kernel_size: Union[int, List[int]] = 2,
             nb_rot_kernels: int = 16,
@@ -43,9 +44,10 @@ class Config:
         self.time_lags = time_lags
         self.initializer_range = initializer_range
         self.leaky_negative_slope = leaky_negative_slope
-        self.readout_activation_fn = readout_activation_fn
-        self.beta = beta
+        self.beta_range = beta_range
+        self.beta_warmup_steps = beta_warmup_steps
         self.hidden_size = hidden_size
+        self.rnn_hidden_size = rnn_hidden_size
 
         # encoder
 

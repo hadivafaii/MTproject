@@ -67,17 +67,32 @@ class SupervisedDataset(Dataset):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
-        source = {
-            expt: stim[..., self.train_indxs[expt][idx % self.lengths[expt]] - self.time_lags: self.train_indxs[expt][idx % self.lengths[expt]]] for
-            (expt, stim) in self.stim.items()}
-        target = {
-            expt: spks[self.train_indxs[expt][idx % self.lengths[expt]]] for
-            (expt, spks) in self.spks.items()}
+        idx_dict = {expt: idx % length for (expt, length) in self.lengths.items()}
+
+        source_stim = {
+            expt: stim[..., self.train_indxs[expt][idx_dict[expt]] - self.time_lags: self.train_indxs[expt][idx_dict[expt]]] for
+            (expt, stim) in self.stim.items()
+        }
+        target_stim = {
+            expt: stim[..., self.train_indxs[expt][idx_dict[expt]]] for
+            (expt, stim) in self.stim.items()
+        }
+        source_spks = {
+            expt: spks[self.train_indxs[expt][idx_dict[expt]] - self.time_lags: self.train_indxs[expt][idx_dict[expt]]] for
+            (expt, spks) in self.spks.items()
+        }
+        target_spks = {
+            expt: spks[self.train_indxs[expt][idx_dict[expt]]] for
+            (expt, spks) in self.spks.items()
+        }
+
+        # TODO: normalize src spks or not?
 
         if self.transform is not None:
-            source = self.transform(source)
+            source_stim = self.transform(source_stim)
+            target_stim = self.transform(target_stim)
 
-        return source, target
+        return source_stim, target_stim, source_spks, target_spks
 
 
 def normalize_fn(x, dim=None):
@@ -95,12 +110,13 @@ def create_datasets(config, xv_folds, rng):
         print('processed data found. loading . . .')
 
         supervised_final = joblib.load(pjoin(_dir, "supervised.sav"))
-        unsupervised_final = joblib.load(pjoin(_dir, "unsupervised.sav"))
+        # unsupervised_final = joblib.load(pjoin(_dir, "unsupervised.sav"))
 
         supervised_dataset = SupervisedDataset(supervised_final, config.time_lags, normalize_fn)
-        unsupervised_dataset = UnSupervisedDataset(unsupervised_final, config.time_lags, normalize_fn)
+        # unsupervised_dataset = UnSupervisedDataset(unsupervised_final, config.time_lags, normalize_fn)
 
-        return supervised_dataset, unsupervised_dataset
+        # return supervised_dataset, unsupervised_dataset
+        return supervised_dataset, None
 
     supervised_data_dict, unsupervised_data_dict = _load_data(config)
 

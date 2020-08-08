@@ -47,21 +47,21 @@ class Trainer:
 
         self.writer = None
 
+        # TODO: pretrain is not well defined right now
+
         self.optim = None
         self.optim_schedule = None
         self._setup_optim()
 
+        # self.optim = None
+        # self.optim_schedule = None
+        # self._setup_optim()
+
         print("\nTotal Parameters:", sum([p.nelement() for p in self.model.parameters()]))
 
-    def train(self, nb_epochs, comment=None):
+    def train(self, nb_epochs, comment, mode='full'):
         assert isinstance(nb_epochs, (int, range)), "Please provide either range or int"
-
-        if comment is None:
-            comment = ""
-            for expt in self.datasets_dict.keys():
-                comment += "{}+".format(expt)
-            comment += 'lr:{:.1e}'.format(self.train_config.lr)
-            comment += 'lr:{:.1e}'.format(self.train_config.batch_size)
+        assert mode in ['pretrain', 'full'], "wrong mode encountered"
 
         self.writer = SummaryWriter(
             pjoin(self.train_config.runs_dir, "{}_{}".format(
@@ -71,7 +71,10 @@ class Trainer:
 
         epochs_range = range(nb_epochs) if isinstance(nb_epochs, int) else nb_epochs
         for epoch in epochs_range:
-            self.iteration(self.unsupervised_train_loader, epoch=epoch)
+            if mode == 'pretrain':
+                self.iteration_pretrain(self.unsupervised_train_loader, epoch=epoch)
+            elif mode == 'full':
+                self.iteration(self.supervised_train_loader, epoch=epoch)
 
             if (epoch + 1) % self.train_config.chkpt_freq == 0:
                 print('Saving chkpt:{:d}'.format(epoch+1))
@@ -80,7 +83,7 @@ class Trainer:
                            comment=comment)
 
     # TODO: adding reg remains
-    def iteration(self, dataloader, epoch=0):
+    def iteration_pretrain(self, dataloader, epoch=0):
         cuml_loss_dict = {'kl': 0.0, 'recon': 0.0, 'tot': 0.0}
 
         max_num_batches = len(dataloader)
@@ -92,8 +95,8 @@ class Trainer:
                 print("i = {}. nan encountered in inputs. moving on".format(i))
                 continue
 
-            z, mu, logvar, recon = self.model(batch_src)
-            loss_dict = self.model.compute_loss(mu, logvar, recon, batch_tgt)
+            z, mu, logvar, recon = self.model.vae(batch_src)
+            loss_dict = self.model.vae.compute_loss(mu, logvar, recon, batch_tgt)
 
             if torch.isnan(loss_dict['tot']).sum().item():
                 print("i = {}. nan encountered in loss. moving on".format(i))
@@ -107,12 +110,6 @@ class Trainer:
                 # add losses to writerreinfor
                 for k, v in loss_dict.items():
                     self.writer.add_scalar("loss/{}".format(k), v.item() / len(batch_src), global_step)
-
-                # add optim state to writer
-                if self.train_config.optim_choice == 'adam_with_warmup':
-                    self.writer.add_scalar('lr', self.optim_schedule.current_lr, global_step)
-                else:
-                    log_lamb_rs(self.optim, self.writer, global_step)
 
             msg0 = 'epoch {:d}'.format(epoch)
             msg1 = ""
@@ -134,6 +131,9 @@ class Trainer:
                 final_loss.backward()
                 self.optim.step()
 
+            # add optim state to writer
+            self.writer.add_scalar('lr', self.optim_schedule.get_last_lr()[0], global_step)
+
             if i + 1 == max_num_batches:
                 msg0 = 'epoch {:d}, '.format(epoch)
                 msg1 = ""
@@ -144,6 +144,131 @@ class Trainer:
 
         if self.train_config.optim_choice == 'adamax':
             self.optim_schedule.step()
+
+    def iteration(self, dataloader, epoch=0):
+        cuml_recon_spks_loss_dict = {expt: 0.0 for expt in self.experiment_names}
+        cuml_recon_stim_loss_dict = {expt: 0.0 for expt in self.experiment_names}
+        cuml_kl_loss_dict = {expt: 0.0 for expt in self.experiment_names}
+        cuml_tot_loss_dict = {expt: 0.0 for expt in self.experiment_names}
+        cuml_reg_loss = 0.0
+
+        max_num_batches = len(dataloader)
+        pbar = tqdm(enumerate(dataloader), total=max_num_batches)
+        for i, [src_stim_dict, tgt_stim_dict, src_spks_dict, tgt_spks_dict] in pbar:
+            loss_dict = {}
+            recon_spks_loss_dict = {}
+
+            batch_data_dict = {expt: (src_stim_dict[expt],
+                                      tgt_stim_dict[expt],
+                                      src_spks_dict[expt],
+                                      tgt_spks_dict[expt]) for expt in self.experiment_names}
+
+            global_step = epoch * max_num_batches + i
+            if global_step > self.config.beta_warmup_steps:
+                current_beta = self.config.beta_range[1]
+            else:
+                current_beta = \
+                    self.config.beta_range[0] + \
+                    (self.config.beta_range[1] - self.config.beta_range[0]) * \
+                    global_step / self.config.beta_warmup_steps
+            self.model.update_beta(current_beta)
+            self.writer.add_scalar("beta", self.model.beta, global_step)
+
+            for expt, data_tuple in batch_data_dict.items():
+                batch_data_tuple = _send_to_cuda(data_tuple, self.device)
+                batch_src_stim, batch_tgt_stim, batch_src_spks, batch_tgt_spks = batch_data_tuple
+
+                if torch.isnan(batch_src_stim).sum().item():
+                    print("expt = {}. i = {}. nan encountered in inputs. moving on".format(expt, i))
+                    continue
+                elif torch.isnan(batch_tgt_stim).sum().item():
+                    print("expt = {}. i = {}. nan encountered in targets. moving on".format(expt, i))
+                    continue
+
+                (_, mu, logvar), (recon_stim, recon_spks) = self.model(batch_src_stim, batch_src_spks, expt)
+                vae_loss_dict = self.model.compute_loss(
+                    mu, logvar, recon_stim, batch_tgt_stim, recon_spks, batch_tgt_spks)
+
+                # if isinstance(self.model, nn.DataParallel):
+                #    loss = self.model.module.criterion(pred, batch_tgt) / self.train_config.batch_size
+                # else:
+                #    loss = self.model.criterion(pred, batch_tgt) / self.train_config.batch_size
+
+                if torch.isnan(vae_loss_dict['tot']).sum().item():
+                    print("expt = {}. i = {}. nan encountered in loss. moving on".format(expt, i))
+                    continue
+
+                loss_dict.update({expt: vae_loss_dict['tot']})
+                recon_spks_loss_dict.update({expt: vae_loss_dict['spks_recon'].item()})
+
+                cuml_recon_spks_loss_dict[expt] += vae_loss_dict['spks_recon'].item()
+                cuml_recon_stim_loss_dict[expt] += vae_loss_dict['stim_recon'].item()
+                cuml_kl_loss_dict[expt] += vae_loss_dict['kl'].item()
+                cuml_tot_loss_dict[expt] += vae_loss_dict['tot'].item()
+
+            if (global_step + 1) % self.train_config.log_freq == 0:
+                # add losses to writerreinfor
+                for k, v in recon_spks_loss_dict.items():
+                    self.writer.add_scalar("recon_spks_loss/{}".format(k), v, global_step)
+
+            msg0 = 'epoch {:d}'.format(epoch)
+            msg1 = ""
+            for k, v in recon_spks_loss_dict.items():
+                msg1 += "{}: {:.3f}, ".format(k, v / self.train_config.batch_size)
+
+            if self.config.regularization is None:
+                final_loss = sum(x for x in loss_dict.values()) / len(loss_dict) / self.train_config.batch_size
+                msg1 += "tot: {:.3f}, ".format(final_loss.item())
+
+            else:
+                reg_losses_dict = self.model.encoder_stim.regularizer.compute_reg_loss(
+                    self.model.encoder_stim.temporal_fcs, self.model.encoder_stim.spatial_fcs)
+
+                if (global_step + 1) % self.train_config.log_freq == 0:
+                    for k, v in reg_losses_dict.items():
+                        self.writer.add_scalar("reg_loss/{}".format(k), v.item(), global_step)
+
+                total_reg_loss = sum(x for x in reg_losses_dict.values()) / len(reg_losses_dict)
+                cuml_reg_loss += total_reg_loss.item()
+
+                total_loss = sum(x for x in loss_dict.values()) / len(loss_dict) / self.train_config.batch_size
+                final_loss = total_loss + total_reg_loss
+
+                msg1 += "tot reg: {:.2e}".format(total_reg_loss.item())
+
+            desc1 = msg0 + '\t|\t' + msg1
+            pbar.set_description(desc1)
+
+            # backward and optimization
+            self.optim.zero_grad()
+            final_loss.backward()
+            self.optim.step()
+
+            # add optim state to writer
+            self.writer.add_scalar('lr', self.optim_schedule.get_last_lr()[0], global_step)
+
+            if i + 1 == max_num_batches:
+                msg0 = 'epoch {:d}, '.format(epoch)
+                msg1 = ""
+                for k, v in cuml_recon_spks_loss_dict.items():
+                    msg1 += "avg_recon_spks {}: {:.2f}, ".format(k, v / max_num_batches / self.train_config.batch_size)
+                msg2 = ""
+                for k, v in cuml_recon_stim_loss_dict.items():
+                    msg2 += "avg_recon_stim {}: {:.2f}, ".format(k, v / max_num_batches / self.train_config.batch_size)
+                msg3 = ""
+                for k, v in cuml_kl_loss_dict.items():
+                    msg3 += "avg_kl {}: {:.2f}, ".format(k, v / max_num_batches / self.train_config.batch_size)
+                msg4 = " . . .  avg loss: {:.4f}, avg reg loss: {:.2e}"
+                msg4 = msg4.format(
+                    sum(cuml_tot_loss_dict.values()) / max_num_batches / self.train_config.batch_size,
+                    cuml_reg_loss / max_num_batches)
+                desc2 = msg0 + msg1 + msg2 + msg3 + msg4
+                pbar.set_description(desc2)
+
+            if (global_step + 1) % self.train_config.log_freq == 0:
+                self.writer.add_scalar("tot_loss", final_loss.item(), global_step)
+
+        self.optim_schedule.step()
 
     def swap_model(self, new_model):
         self.model = new_model.to(self.device)
@@ -174,7 +299,7 @@ class Trainer:
                 betas=self.train_config.betas,
                 weight_decay=self.train_config.weight_decay,
             )
-            self.optim_schedule = CosineAnnealingLR(self.optim, T_max=20, eta_min=1e-6)
+            self.optim_schedule = CosineAnnealingLR(self.optim, T_max=10, eta_min=1e-7)
 
         elif self.train_config.optim_choice == 'adam_with_warmup':
             self.optim = Adam(
@@ -190,6 +315,15 @@ class Trainer:
 
         else:
             raise ValueError("Invalid optimizer choice: {}".format(self.train_config.optim_chioce))
+
+    # TODO: it appeaers this is not needed at this point
+    def _setup_optim_pretrain(self):
+        self.optim_fine_tuning = Adam([
+            {'params': self.model.encoder_stim.parameters()},
+            {'params': self.model.decoder_stim.parameters()}],
+            lr=1e-2, weight_decay=0.001,
+        )
+        self.optim_schedule_fine_tuning = CosineAnnealingLR(self.optim_fine_tuning, T_max=10, eta_min=1e-6)
 
     def _setup_data(self):
         supervised_dataset, unsupervised_dataset = create_datasets(

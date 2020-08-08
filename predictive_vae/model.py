@@ -17,6 +17,169 @@ from torch.optim import Adam
 from .model_utils import print_num_params, get_activation_fn
 
 
+class MTNet(nn.Module):
+    def __init__(self, config, verbose=True):
+        super(MTNet, self).__init__()
+
+        self.config = config
+        self.beta = 0.0
+
+        self.encoder_stim = RotationalConvEncoder(config, verbose=verbose)
+        self.decoder_stim = ConvDecoder(config, verbose=verbose)
+
+        self.encoder_spks = SpksEncoder(config, verbose=verbose)
+        self.decoder_spks = SpksDecoder(config, verbose=verbose)
+
+        self.recon_criterion_stim = nn.MSELoss(reduction="sum")
+        self.recon_criterion_spks = nn.PoissonNLLLoss(log_input=False, reduction="sum")
+
+        self.init_weights()
+        if verbose:
+            print_num_params(self)
+
+    def compute_loss(self, mu, logvar, recon_stim, tgt_stim, recon_spks, tgt_spks):
+        stim_recon_term = self.recon_criterion_stim(recon_stim, tgt_stim)
+        spks_recon_term = self.recon_criterion_spks(recon_spks, tgt_spks)
+        kl_term = self.beta * -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp())
+
+        loss_dict = {
+            "kl": kl_term,
+            "stim_recon": stim_recon_term,
+            "spks_recon": spks_recon_term,
+            "tot": stim_recon_term + spks_recon_term + kl_term,
+        }
+        return loss_dict
+
+    def forward(self, src_stim, src_spks, experiment_name: str):
+        mu_stim, logvar_stim = self.encoder_stim(src_stim)
+        mu_spks, logvar_spks = self.encoder_spks(src_spks, experiment_name)
+
+        mu = torch.cat([mu_stim, mu_spks], dim=-1)
+        logvar = torch.cat([logvar_stim, logvar_spks], dim=-1)
+
+        z = self.reparametrize(mu, logvar)
+
+        recon_stim = self.decoder_stim(z)
+        recon_spks = self.decoder_spks(z, experiment_name)
+
+        return (z, mu, logvar), (recon_stim, recon_spks)
+
+    @staticmethod
+    def reparametrize(mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn(*mu.size()).to(mu.device)
+        z = mu + std * eps
+        return z
+
+    def update_beta(self, new_beta):
+        assert new_beta >= 0.0, "beta must be non-negative"
+        self.beta = new_beta
+
+    def init_weights(self):
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """ Initialize the weights """
+        if isinstance(module, (nn.Linear, nn.Conv3d, nn.ConvTranspose2d)):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        else:
+            pass
+
+
+class SpksEncoder(nn.Module):
+    def __init__(self, config, verbose=True):
+        super(SpksEncoder, self).__init__()
+
+        rnns = {}
+        for expt, good_channels in config.useful_cells.items():
+            rnns.update({expt: nn.LSTM(
+                len(good_channels),
+                config.rnn_hidden_size,
+                bidirectional=True,
+                batch_first=True,)})
+        self.rnns = nn.ModuleDict(rnns)
+
+        self.relu = nn.ReLU()
+        self.linear = nn.Linear(2 * config.rnn_hidden_size, 4 * config.rnn_hidden_size, bias=True)
+        self.fc1 = nn.Linear(4 * config.rnn_hidden_size, config.hidden_size, bias=True)
+        self.fc2 = nn.Linear(4 * config.rnn_hidden_size, config.hidden_size, bias=True)
+
+        if verbose:
+            print_num_params(self)
+
+    def forward(self, src_spks, experiment_name: str):
+        # input is N x nb_cells
+        _, (h_n, _) = self.rnns[experiment_name](src_spks)  # 2 x N x rnn_hidden_size
+        h = h_n.permute(1, 2, 0)  # N x rnn_hidden_size x 2
+        h = h.reshape(-1, self.linear.in_features)  # N x rnn_hidden_size*2
+        x = self.linear(h)
+        x = self.relu(x)
+
+        mu = self.fc1(x)
+        logvar = self.fc2(x)
+
+        return mu, logvar
+
+
+class SpksDecoder(nn.Module):
+    def __init__(self, config, verbose=True):
+        super(SpksDecoder, self).__init__()
+
+        self.relu = nn.ReLU()
+        self.linear = nn.Linear(2 * config.hidden_size, 4 * config.hidden_size, bias=True)
+        self.norm = nn.LayerNorm(4 * config.hidden_size, config.layer_norm_eps)
+
+        layers = {}
+        for expt, good_channels in config.useful_cells.items():
+            layers.update({expt: nn.Linear(4 * config.hidden_size, len(good_channels))})
+        self.layers = nn.ModuleDict(layers)
+
+        self.softplus = nn.Softplus()
+
+        if verbose:
+            print_num_params(self)
+
+    def forward(self, z, experiment_name: str):
+        x = self.relu(self.linear(z))
+        x = self.norm(x)
+        y = self.layers[experiment_name](x)
+        y = self.softplus(y)
+
+        return y
+
+
+class MTReadout(nn.Module):
+    def __init__(self, config, verbose=True):
+        super(MTReadout, self).__init__()
+
+        self.config = config
+        self.norm = nn.LayerNorm(config.hidden_size * 2, config.layer_norm_eps)
+
+        # TODO: idea, you can replace a linear layer with FF and some dim reduction:
+        #  hidden_dim -> readout_dim (e.g. 80)
+        layers = {}
+        for expt, good_channels in config.useful_cells.items():
+            layers.update({expt: nn.Linear(config.hidden_size * 2, len(good_channels), bias=True)})
+        self.layers = nn.ModuleDict(layers)
+
+        self.activation = get_activation_fn(config.readout_activation_fn)
+        if verbose:
+            print_num_params(self)
+
+    def forward(self, z, experiment_name: str):
+        # input is N x hidden_size*2
+        z = self.norm(z)
+        y = self.layers[experiment_name](z)  # N x nb_cells
+        y = self.activation(y)
+
+        return y
+
+
 class PredictiveVAE(nn.Module):
     def __init__(self, config, verbose=True):
         super(PredictiveVAE, self).__init__()
@@ -28,7 +191,6 @@ class PredictiveVAE(nn.Module):
         # self.decoder = FFDecoder(config, verbose=verbose)
 
         self.recon_criterion = nn.MSELoss(reduction="sum")
-        self.init_weights()
         if verbose:
             print_num_params(self)
 
@@ -57,19 +219,6 @@ class PredictiveVAE(nn.Module):
         }
         return loss_dict
 
-    def init_weights(self):
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        """ Initialize the weights """
-        if isinstance(module, (nn.Linear, nn.Conv2d, nn.Conv3d, nn.ConvTranspose2d)):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-
 
 class FFDecoder(nn.Module):
     def __init__(self, config, verbose=True):
@@ -96,8 +245,8 @@ class ConvDecoder(nn.Module):
         super(ConvDecoder, self).__init__()
 
         self.init_grid_size = config.decoder_init_grid_size
-        self.linear = nn.Linear(
-            config.hidden_size, config.nb_decoder_units[0] * self.init_grid_size * self.init_grid_size, bias=True)
+        self.linear = nn.Linear(2 * config.hidden_size,
+                                config.nb_decoder_units[0] * self.init_grid_size * self.init_grid_size, bias=True)
 
         layers = []
         for i in range(1, len(config.nb_decoder_units)):
@@ -235,37 +384,12 @@ class RotationalConvEncoder(nn.Module):
         x = self.leaky_relu2(x)
         x = self.dropout2(x)
 
+        # TODO: try adding an intermediate fc here before mu and logvar
+
         mu = self.fc1(x)
         logvar = self.fc2(x)
 
         return mu, logvar
-
-
-class MTReadout(nn.Module):
-    def __init__(self, config, verbose=True):
-        super(MTReadout, self).__init__()
-
-        self.config = config
-        self.norm = nn.LayerNorm(config.hidden_size, config.layer_norm_eps)
-
-        # TODO: idea, you can replace a linear layer with FF and some dim reduction:
-        #  hidden_dim -> readout_dim (e.g. 80)
-        layers = {}
-        for expt, good_channels in config.useful_cells.items():
-            layers.update({expt: nn.Linear(config.hidden_size, len(good_channels), bias=True)})
-        self.layers = nn.ModuleDict(layers)
-
-        self.activation = get_activation_fn(config.readout_activation_fn)
-        if verbose:
-            print_num_params(self)
-
-    def forward(self, x, experiment_name: str):
-        # input is N x hidden_size
-        x = self.norm(x)
-        y = self.layers[experiment_name](x)  # N x nb_cells
-        y = self.activation(y)
-
-        return y
 
 
 class RotConv3d(nn.Conv3d):

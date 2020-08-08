@@ -108,10 +108,10 @@ def save_model(model, prefix=None, comment=None):
         yaml.dump(config_dict, f)
 
 
-def load_model(keyword, chkpt_id=-1, config=None, verbose=False):
+def load_model(keyword, chkpt_id=-1, config=None, verbose=False, base_dir='Documents/PROJECTS/MT_LFP'):
     from .model import PredictiveVAE
 
-    _dir = pjoin(os.environ['HOME'], 'Documents/PROJECTS/MT_LFP',  'saved_models')
+    _dir = pjoin(os.environ['HOME'], base_dir, 'saved_models')
     available_models = os.listdir(_dir)
     if verbose:
         print('Available models to load:\n', available_models)
@@ -151,7 +151,7 @@ def load_model(keyword, chkpt_id=-1, config=None, verbose=False):
     model_name = load_dir.split("/")[-2]
     metadata = {"chkpt": chkpt, "model_name": model_name}
 
-    return loaded_model, metadata
+    return loaded_model.eval(), metadata
 
 
 def print_num_params(module: nn.Module):
@@ -161,7 +161,7 @@ def print_num_params(module: nn.Module):
         total_params = sum(p.numel() for p in m.parameters() if p.requires_grad)
         if '.' not in name:
             if isinstance(m, type(module)):
-                t.add_row(["Total", "{}".format(total_params)])
+                t.add_row(["{}".format(m.__class__.__name__), "{}".format(total_params)])
                 t.add_row(['---', '---'])
             else:
                 t.add_row([name, "{}".format(total_params)])

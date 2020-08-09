@@ -1,5 +1,4 @@
 import os
-from abc import ABCMeta
 from datetime import datetime
 from os.path import join as pjoin
 from tqdm import tqdm
@@ -40,7 +39,7 @@ class MTNet(nn.Module):
         if experiment_name is None:
             return self.decoder(z)
         else:
-            # TODO: still not sure use z or the whole gang x_i for fine tuning
+            # TODO: still not sure use z or the whole x_i gang for fine-tuning
             return self.readout(z, experiment_name)
 
     def init_weights(self):
@@ -77,7 +76,8 @@ class MTReadout(nn.Module):
             print_num_params(self)
 
     def forward(self, z, experiment_name: str):
-        x = self.relu(self.linear(z))
+        x = self.linear(z)
+        x = self.relu(x)
         x = self.norm(x)
         y = self.layers[experiment_name](x)
         y = self.softplus(y)
@@ -92,12 +92,13 @@ class FFDecoder(nn.Module):
         self.linear1 = nn.Linear(config.hidden_size, 128)
         self.linear2 = nn.Linear(128, 2 * config.grid_size ** 2)
 
-        self.activation = nn.ReLU()
+        self.relu = nn.ReLU()
         if verbose:
             print_num_params(self)
 
     def forward(self, x):
-        x = self.activation(self.linear1(x))
+        x = self.linear1(x)
+        x = self.relu(x)
         x = self.linear2(x)
 
         return x
@@ -166,13 +167,6 @@ class ResNet(nn.Module):
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(self.inplanes, config.hidden_size)
-
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
 
         if verbose:
             print_num_params(self)
@@ -260,6 +254,7 @@ class RotationalConvBlock(nn.Module):
         # x : N x 2 x grd x grd x tau
         x = self.chomp3d(self.rot_conv3d(x))  # N x C x grd x grd x tau
         x = self.bn(x)
+        # TODO: experiment with exp nonlinearity
         x = self.relu(x)
         x = self.temporal_fc(x)  # N x C x grd x grd x nb_temporal_units
         x = x.permute(0, 1, 4, 2, 3).flatten(start_dim=1, end_dim=2)  # N x C*nb_temporal_units x grd x grd

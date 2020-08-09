@@ -24,6 +24,7 @@ class Config:
             nb_decoder_units: List[int] = None,
             decoder_kernel_sizes: List[int] = None,
             decoder_strides: List[int] = None,
+
             regularization: Dict[str, float] = None,
             dropout: float = 0.5,
             layer_norm_eps: float = 1e-12,
@@ -124,8 +125,7 @@ class TrainConfig:
             use_cuda: bool = True,
             log_freq: int = 10,
             chkpt_freq: int = 1,
-            # scheduler_step_freq: int = 5000,
-            batch_size: int = 768,
+            batch_size: int = 1024,
             xv_folds: int = 5,
             runs_dir: str = 'Documents/MT/runs',
     ):
@@ -141,7 +141,6 @@ class TrainConfig:
         self.use_cuda = use_cuda
         self.log_freq = log_freq
         self.chkpt_freq = chkpt_freq
-        # self.scheduler_step_freq = scheduler_step_freq
         self.batch_size = batch_size
         self.xv_folds = xv_folds
         self.runs_dir = pjoin(os.environ['HOME'], runs_dir)

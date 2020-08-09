@@ -35,7 +35,6 @@ class Trainer:
 
         self.model = model.to(self.device)
         self.config = model.config
-
         self.train_config = train_config
 
         self.experiment_names = list(self.config.useful_cells.keys())
@@ -97,13 +96,6 @@ class Trainer:
 
             if mode == 'pretrain':
                 src, tgt = _send_to_cuda(data, self.device)
-                if torch.isnan(src).sum().item():
-                    print("i = {}. nan encountered in inputs. moving on".format(i))
-                    continue
-                elif torch.isnan(tgt).sum().item():
-                    print("i = {}. nan encountered in targets. moving on".format(i))
-                    continue
-
                 pred_stim = self.model(src)
                 final_loss = self.model.criterion_stim(pred_stim, tgt) / self.train_config.batch_size
                 cuml_loss += final_loss.item()
@@ -113,16 +105,8 @@ class Trainer:
                 loss_dict = {}
                 for expt, data_tuple in batch_data_dict.items():
                     src, tgt = _send_to_cuda(data_tuple, self.device)
-                    if torch.isnan(src).sum().item():
-                        print("expt = {}. i = {}. nan encountered in inputs. moving on".format(expt, i))
-                        continue
-                    elif torch.isnan(tgt).sum().item():
-                        print("expt = {}. i = {}. nan encountered in targets. moving on".format(expt, i))
-                        continue
-
                     pred_spks = self.model(src, expt)
                     loss = self.model.criterion_spks(pred_spks, tgt) / self.train_config.batch_size
-
                     loss_dict.update({expt: loss})
                     cuml_loss_dict[expt] += loss.item()
 
@@ -132,10 +116,6 @@ class Trainer:
                     msg1 += "{}: {:.3f}, ".format(k, v)
             else:
                 raise RuntimeError("invalid mode value encountered: {}".format(mode))
-
-            if torch.isnan(final_loss).sum().item():
-                print("i = {}. nan encountered in loss. moving on".format(i))
-                continue
 
             if self.config.regularization is None:
                 msg1 += "tot: {:.3f}, ".format(final_loss.item())

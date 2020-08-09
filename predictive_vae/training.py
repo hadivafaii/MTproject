@@ -82,69 +82,6 @@ class Trainer:
                            prefix='chkpt:{:d}'.format(epoch+1),
                            comment=comment)
 
-    # TODO: adding reg remains
-    def iteration_pretrain(self, dataloader, epoch=0):
-        cuml_loss_dict = {'kl': 0.0, 'recon': 0.0, 'tot': 0.0}
-
-        max_num_batches = len(dataloader)
-        pbar = tqdm(enumerate(dataloader), total=max_num_batches)
-        for i, data_tuple in pbar:
-            batch_src, batch_tgt = _send_to_cuda(data_tuple, self.device)
-
-            if torch.isnan(batch_src).sum().item():
-                print("i = {}. nan encountered in inputs. moving on".format(i))
-                continue
-
-            z, mu, logvar, recon = self.model.vae(batch_src)
-            loss_dict = self.model.vae.compute_loss(mu, logvar, recon, batch_tgt)
-
-            if torch.isnan(loss_dict['tot']).sum().item():
-                print("i = {}. nan encountered in loss. moving on".format(i))
-                continue
-
-            for k, v in loss_dict.items():
-                cuml_loss_dict[k] += v.item()
-
-            global_step = epoch * max_num_batches + i
-            if (global_step + 1) % self.train_config.log_freq == 0:
-                # add losses to writerreinfor
-                for k, v in loss_dict.items():
-                    self.writer.add_scalar("loss/{}".format(k), v.item() / len(batch_src), global_step)
-
-            msg0 = 'epoch {:d}'.format(epoch)
-            msg1 = ""
-            for k, v in loss_dict.items():
-                msg1 += "{}: {:.2e}, ".format(k, v.item() / len(batch_src))
-
-            desc1 = msg0 + '\t|\t' + msg1
-            pbar.set_description(desc1)
-
-            final_loss = loss_dict['tot'] / len(batch_src)
-
-            # backward and optimization only in train
-            if self.train_config.optim_choice == 'adam_with_warmup':
-                self.optim_schedule.zero_grad()
-                final_loss.backward()
-                self.optim_schedule.step_and_update_lr()
-            else:
-                self.optim.zero_grad()
-                final_loss.backward()
-                self.optim.step()
-
-            # add optim state to writer
-            self.writer.add_scalar('lr', self.optim_schedule.get_last_lr()[0], global_step)
-
-            if i + 1 == max_num_batches:
-                msg0 = 'epoch {:d}, '.format(epoch)
-                msg1 = ""
-                for k, v in cuml_loss_dict.items():
-                    msg1 += "avg {}: {:.3e}, ".format(k, v / max_num_batches / self.train_config.batch_size)
-                desc2 = msg0 + msg1
-                pbar.set_description(desc2)
-
-        if self.train_config.optim_choice == 'adamax':
-            self.optim_schedule.step()
-
     def iteration(self, dataloader, epoch=0):
         cuml_recon_spks_loss_dict = {expt: 0.0 for expt in self.experiment_names}
         cuml_recon_stim_loss_dict = {expt: 0.0 for expt in self.experiment_names}
@@ -217,7 +154,7 @@ class Trainer:
                 msg1 += "{}: {:.3f}, ".format(k, v / self.train_config.batch_size)
 
             if self.config.regularization is None:
-                final_loss = sum(x for x in loss_dict.values()) / len(loss_dict) / self.train_config.batch_size
+                final_loss = sum(x for x in loss_dict.values()) / (len(loss_dict) * self.train_config.batch_size)
                 msg1 += "tot: {:.3f}, ".format(final_loss.item())
 
             else:
@@ -228,10 +165,10 @@ class Trainer:
                     for k, v in reg_losses_dict.items():
                         self.writer.add_scalar("reg_loss/{}".format(k), v.item(), global_step)
 
-                total_reg_loss = sum(x for x in reg_losses_dict.values()) / len(reg_losses_dict)
+                total_reg_loss = sum(x for x in reg_losses_dict.values())
                 cuml_reg_loss += total_reg_loss.item()
 
-                total_loss = sum(x for x in loss_dict.values()) / len(loss_dict) / self.train_config.batch_size
+                total_loss = sum(x for x in loss_dict.values()) / (len(loss_dict) * self.train_config.batch_size)
                 final_loss = total_loss + total_reg_loss
 
                 msg1 += "tot reg: {:.2e}".format(total_reg_loss.item())
@@ -252,23 +189,133 @@ class Trainer:
                 msg1 = ""
                 for k, v in cuml_recon_spks_loss_dict.items():
                     msg1 += "avg_recon_spks {}: {:.2f}, ".format(k, v / max_num_batches / self.train_config.batch_size)
-                msg2 = ""
-                for k, v in cuml_recon_stim_loss_dict.items():
-                    msg2 += "avg_recon_stim {}: {:.2f}, ".format(k, v / max_num_batches / self.train_config.batch_size)
-                msg3 = ""
-                for k, v in cuml_kl_loss_dict.items():
-                    msg3 += "avg_kl {}: {:.2f}, ".format(k, v / max_num_batches / self.train_config.batch_size)
-                msg4 = " . . .  avg loss: {:.4f}, avg reg loss: {:.2e}"
-                msg4 = msg4.format(
-                    sum(cuml_tot_loss_dict.values()) / max_num_batches / self.train_config.batch_size,
-                    cuml_reg_loss / max_num_batches)
-                desc2 = msg0 + msg1 + msg2 + msg3 + msg4
+                msg2 = " . . .  avg kl loss : {:.3f}, avg stim recon loss : {:.3f} avg loss: {:.3f}, avg reg loss: {:.2e}"
+                msg2 = msg2.format(
+                    np.mean(list(cuml_kl_loss_dict.values())) / max_num_batches / self.train_config.batch_size,
+                    np.mean(list(cuml_recon_stim_loss_dict.values())) / max_num_batches / self.train_config.batch_size,
+                    np.mean(list(cuml_tot_loss_dict.values())) / max_num_batches / self.train_config.batch_size,
+                    cuml_reg_loss / max_num_batches,)
+                desc2 = msg0 + msg1 + msg2
                 pbar.set_description(desc2)
 
             if (global_step + 1) % self.train_config.log_freq == 0:
                 self.writer.add_scalar("tot_loss", final_loss.item(), global_step)
 
         self.optim_schedule.step()
+
+    # TODO: adding reg remains
+    def iteration_pretrain(self, dataloader, epoch=0):
+        cuml_loss_dict = {'kl': 0.0, 'recon': 0.0, 'tot': 0.0}
+
+        max_num_batches = len(dataloader)
+        pbar = tqdm(enumerate(dataloader), total=max_num_batches)
+        for i, data_tuple in pbar:
+            batch_src, batch_tgt = _send_to_cuda(data_tuple, self.device)
+
+            if torch.isnan(batch_src).sum().item():
+                print("i = {}. nan encountered in inputs. moving on".format(i))
+                continue
+
+            z, mu, logvar, recon = self.model.vae(batch_src)
+            loss_dict = self.model.vae.compute_loss(mu, logvar, recon, batch_tgt)
+
+            if torch.isnan(loss_dict['tot']).sum().item():
+                print("i = {}. nan encountered in loss. moving on".format(i))
+                continue
+
+            for k, v in loss_dict.items():
+                cuml_loss_dict[k] += v.item()
+
+            global_step = epoch * max_num_batches + i
+            if (global_step + 1) % self.train_config.log_freq == 0:
+                # add losses to writerreinfor
+                for k, v in loss_dict.items():
+                    self.writer.add_scalar("loss/{}".format(k), v.item() / len(batch_src), global_step)
+
+            msg0 = 'epoch {:d}'.format(epoch)
+            msg1 = ""
+            for k, v in loss_dict.items():
+                msg1 += "{}: {:.2e}, ".format(k, v.item() / len(batch_src))
+
+            desc1 = msg0 + '\t|\t' + msg1
+            pbar.set_description(desc1)
+
+            final_loss = loss_dict['tot'] / len(batch_src)
+
+            # backward and optimization only in train
+            if self.train_config.optim_choice == 'adam_with_warmup':
+                self.optim_schedule.zero_grad()
+                final_loss.backward()
+                self.optim_schedule.step_and_update_lr()
+            else:
+                self.optim.zero_grad()
+                final_loss.backward()
+                self.optim.step()
+
+            # add optim state to writer
+            self.writer.add_scalar('lr', self.optim_schedule.get_last_lr()[0], global_step)
+
+            if i + 1 == max_num_batches:
+                msg0 = 'epoch {:d}, '.format(epoch)
+                msg1 = ""
+                for k, v in cuml_loss_dict.items():
+                    msg1 += "avg {}: {:.3e}, ".format(k, v / max_num_batches / self.train_config.batch_size)
+                desc2 = msg0 + msg1
+                pbar.set_description(desc2)
+
+        if self.train_config.optim_choice == 'adamax':
+            self.optim_schedule.step()
+
+    def generante_prediction(self, mode='train'):
+        self.model.eval()
+        preds_dict = {}
+
+        for expt in self.experiment_names:
+            if mode == 'train':
+                indxs = self.dataset.train_indxs[expt]
+            elif mode == 'valid':
+                indxs = self.dataset.valid_indxs[expt]
+            else:
+                raise ValueError("Invalid mode: {}".format(mode))
+
+            src = []
+            tgt = []
+            for idx in indxs:
+                src.append(np.expand_dims(self.dataset.stim[expt][..., idx - self.config.time_lags: idx], axis=0))
+                tgt.append(np.expand_dims(self.dataset.spks[expt][idx], axis=0))
+
+            src = np.concatenate(src).astype(float)
+            tgt = np.concatenate(tgt).astype(float)
+
+            num_batches = int(np.ceil(len(indxs) / self.train_config.batch_size))
+            true_list = []
+            pred_list = []
+            for b in range(num_batches):
+                start = b * self.train_config.batch_size
+                end = min((b + 1) * self.train_config.batch_size, len(indxs))
+
+                src_slice = src[range(start, end)]
+                original_shape = src_slice.shape
+                src_slice_normalized = normalize_fn(src_slice.reshape(original_shape[0], -1), dim=-1)
+
+                data_tuple = (src_slice_normalized.reshape(original_shape), tgt[range(start, end)])
+                data_tuple = tuple(map(lambda z: torch.tensor(z), data_tuple))
+
+                batch_data_tuple = _send_to_cuda(data_tuple, self.device)
+                with torch.no_grad():
+                    if self.config.multicell:
+                        pred = self.model(batch_data_tuple[0], expt)
+                    else:
+                        pred = self.model(batch_data_tuple[0])
+
+                true_list.append(batch_data_tuple[1])
+                pred_list.append(pred)
+
+            true = torch.cat(true_list)
+            pred = torch.cat(pred_list)
+            preds_dict.update({expt: (to_np(true), to_np(pred))})
+
+        return preds_dict
 
     def swap_model(self, new_model):
         self.model = new_model.to(self.device)

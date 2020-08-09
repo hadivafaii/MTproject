@@ -12,20 +12,15 @@ class Config:
             grid_size: int = 15,
             decoder_init_grid_size: int = 3,
             temporal_res: int = 25,
-            time_lags: int = 20,
-            initializer_range: float = 0.01,
-            leaky_negative_slope: float = 0.2,
-            beta_range: List[float] = None,
-            beta_warmup_steps: int = 5000,
-            hidden_size: int = 128,
-            rnn_hidden_size: int = 64,
-            rot_kernel_size: Union[int, List[int]] = 2,
-            conv_kernel_size: Union[int, List[int]] = 2,
+            time_lags: int = 12,
+
+            hidden_size: int = 64,
+            rot_kernel_size: Union[int, List[int]] = 3,
             nb_rot_kernels: int = 16,
             nb_rotations: int = 8,
-            nb_conv_units: List[int] = None,
-            nb_spatial_units: List[int] = None,
-            nb_temporal_units: List[int] = None,
+            nb_temporal_units: int = 2,
+
+            nb_readout_spatial_units: List[int] = None,
             nb_decoder_units: List[int] = None,
             decoder_kernel_sizes: List[int] = None,
             decoder_strides: List[int] = None,
@@ -42,45 +37,21 @@ class Config:
         self.decoder_init_grid_size = decoder_init_grid_size
         self.temporal_res = temporal_res
         self.time_lags = time_lags
-        self.initializer_range = initializer_range
-        self.leaky_negative_slope = leaky_negative_slope
-        if beta_range is None:
-            self.beta_range = [0.0, 1.0]
-        else:
-            self.beta_range = beta_range
-        self.beta_warmup_steps = beta_warmup_steps
         self.hidden_size = hidden_size
-        self.rnn_hidden_size = rnn_hidden_size
 
         # encoder
-
         if isinstance(rot_kernel_size, int):
             self.rot_kernel_size = [rot_kernel_size] * 3
         else:
             self.rot_kernel_size = rot_kernel_size
-        if isinstance(conv_kernel_size, int):
-            self.conv_kernel_size = [conv_kernel_size] * 3
-        else:
-            self.conv_kernel_size = conv_kernel_size
-
         self.nb_rot_kernels = nb_rot_kernels
         self.nb_rotations = nb_rotations
+        self.nb_temporal_units = nb_temporal_units
 
-        if nb_conv_units is None:
-            self.nb_conv_units = [256, 512]
+        if nb_readout_spatial_units is None:
+            self.nb_readout_spatial_units = [128, 8, 2]
         else:
-            self.nb_conv_units = nb_conv_units
-        if nb_spatial_units is None:
-            self.nb_spatial_units = [128, 8, 2]
-        else:
-            self.nb_spatial_units = nb_spatial_units
-        if nb_temporal_units is None:
-            self.nb_temporal_units = [2, 2, 1]
-        else:
-            self.nb_temporal_units = nb_temporal_units
-
-        assert len(self.nb_spatial_units) == len(self.nb_temporal_units) == \
-               len(self.nb_conv_units) + 1 <= int(np.floor(np.log2(self.grid_size))) + 1
+            self.nb_readout_spatial_units = nb_readout_spatial_units
 
         # decoder
         if nb_decoder_units is None:
@@ -95,11 +66,6 @@ class Config:
             self.decoder_strides = [2, 2, 1]
         else:
             self.decoder_strides = decoder_strides
-
-        assert self.nb_decoder_units[-1] == 2, "must reproduce a vel field with two channels"
-        assert len(self.nb_decoder_units) - 1 == \
-               len(self.decoder_kernel_sizes) == \
-               len(self.decoder_strides)
 
         self.regularization = regularization
         self.dropout = dropout

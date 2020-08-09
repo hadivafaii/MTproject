@@ -284,12 +284,12 @@ class RotationalConvEncoder(nn.Module):
         self.rot_chomp3d = Chomp(chomp_sizes=[k - 1 for k in config.rot_kernel_size], nb_dims=3)
         self.chomp3d = Chomp(chomp_sizes=[k - 1 for k in config.conv_kernel_size], nb_dims=3)
 
-        self.rot_conv3d = RotConv3d(
+        self.rot_conv3d = weight_norm(RotConv3d(
             in_channels=2,
             out_channels=config.nb_rot_kernels,
             nb_rotations=config.nb_rotations,
             kernel_size=config.rot_kernel_size,
-            padding=[k - 1 for k in config.rot_kernel_size],)
+            padding=[k - 1 for k in config.rot_kernel_size],))
 
         self.nb_conv_units = [config.nb_rotations * config.nb_rot_kernels] + config.nb_conv_units
 
@@ -306,11 +306,11 @@ class RotationalConvEncoder(nn.Module):
             in_channels = self.nb_conv_units[i-1]
             out_channels = self.nb_conv_units[i]
 
-            convs_list.append(nn.Conv3d(
+            convs_list.append(weight_norm(nn.Conv3d(
                 in_channels=in_channels,
                 out_channels=out_channels,
                 kernel_size=config.conv_kernel_size,
-                padding=[k - 1 for k in config.conv_kernel_size],))
+                padding=[k - 1 for k in config.conv_kernel_size],)))
             downsamples_list.append(nn.Conv3d(in_channels, out_channels, 1) if in_channels != out_channels else None)
             activations_list.append(nn.LeakyReLU(negative_slope=config.leaky_negative_slope))
 

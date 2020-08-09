@@ -214,17 +214,6 @@ class Trainer:
         self.model = new_model.to(self.device)
         self.config = new_model.config
 
-    def _setup_optim(self):
-        self.optim_pretrain = Adamax([
-            {'params': self.model.encoder.parameters()},
-            {'params': self.model.decoder.parameters()}],
-            lr=1e-2, weight_decay=0.0,)
-        self.optim_finetune = AdamW([
-            {'params': self.model.encoder.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
-            {'params': self.model.readout.parameters(), 'lr': 1e-2, 'weight_decay': 1e-2}],)
-        self.optim_schedule_pretrain = CosineAnnealingLR(self.optim_pretrain, T_max=5, eta_min=1e-7)
-        self.optim_schedule_finetune = CosineAnnealingLR(self.optim_finetune, T_max=10, eta_min=1e-7)
-
     def _setup_data(self):
         supervised_dataset, unsupervised_dataset = create_datasets(
             self.config, self.train_config.xv_folds, self.rng)
@@ -239,6 +228,17 @@ class Trainer:
             dataset=unsupervised_dataset,
             batch_size=self.train_config.batch_size,
             drop_last=True,)
+
+    def _setup_optim(self):
+        self.optim_pretrain = Adamax([
+            {'params': self.model.encoder.parameters()},
+            {'params': self.model.decoder.parameters()}],
+            lr=1e-2, weight_decay=0.0,)
+        self.optim_finetune = AdamW([
+            {'params': self.model.encoder.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
+            {'params': self.model.readout.parameters(), 'lr': 1e-2, 'weight_decay': 1e-2}],)
+        self.optim_schedule_pretrain = CosineAnnealingLR(self.optim_pretrain, T_max=5, eta_min=1e-7)
+        self.optim_schedule_finetune = CosineAnnealingLR(self.optim_finetune, T_max=10, eta_min=1e-7)
 
 
 def _send_to_cuda(data_tuple, device, dtype=torch.float32):

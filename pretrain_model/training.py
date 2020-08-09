@@ -9,7 +9,7 @@ from copy import deepcopy as dc
 
 import torch
 from torch import nn
-from torch.optim import Adam, Adamax
+from torch.optim import Adamax, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
@@ -17,9 +17,6 @@ from tensorboardX import SummaryWriter
 from .optimizer import Lamb, log_lamb_rs, ScheduledOptim
 from .dataset import create_datasets
 from .model_utils import save_model
-
-import sys; sys.path.append('..')
-from utils.generic_utils import to_np, plot_vel_field
 
 
 class Trainer:
@@ -47,11 +44,11 @@ class Trainer:
         self.writer = None
 
         self.optim_pretrain = None
-        self.optim_schedule_pretrain = None
-        self._setup_optim_pretrain()
-
         self.optim_finetune = None
+        self.optim_schedule_pretrain = None
         self.optim_schedule_finetune = None
+        self._setup_optim()
+
         self._setup_optim_finetune()
 
         print("\nTotal Parameters:", sum([p.nelement() for p in self.model.parameters()]))
@@ -209,9 +206,7 @@ class Trainer:
                 true_list.append(batch_data_tuple[1])
                 pred_list.append(pred)
 
-            true = torch.cat(true_list)
-            pred = torch.cat(pred_list)
-            preds_dict.update({expt: (to_np(true), to_np(pred))})
+            preds_dict.update({expt: (torch.cat(true_list), torch.cat(pred_list))})
 
         return preds_dict
 
@@ -220,62 +215,15 @@ class Trainer:
         self.config = new_model.config
 
     def _setup_optim(self):
-        if self.train_config.optim_choice == 'lamb':
-            self.optim = Lamb(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=self.train_config.lr,
-                betas=self.train_config.betas,
-                weight_decay=self.train_config.weight_decay,
-                adam=False,
-            )
-
-        elif self.train_config.optim_choice == 'adam':
-            self.optim = Adam(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=self.train_config.lr,
-                betas=self.train_config.betas,
-                weight_decay=self.train_config.weight_decay,
-            )
-
-        elif self.train_config.optim_choice == 'adamax':
-            self.optim = Adamax(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=self.train_config.lr,
-                betas=self.train_config.betas,
-                weight_decay=self.train_config.weight_decay,
-            )
-            self.optim_schedule = CosineAnnealingLR(self.optim, T_max=10, eta_min=1e-7)
-
-        elif self.train_config.optim_choice == 'adam_with_warmup':
-            self.optim = Adam(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                betas=self.train_config.betas,
-                weight_decay=self.train_config.weight_decay,
-            )
-            self.optim_schedule = ScheduledOptim(
-                optimizer=self.optim,
-                hidden_size=256,
-                n_warmup_steps=self.train_config.warmup_steps,
-            )
-
-        else:
-            raise ValueError("Invalid optimizer choice: {}".format(self.train_config.optim_chioce))
-
-    def _setup_optim_pretrain(self):
         self.optim_pretrain = Adamax([
             {'params': self.model.encoder.parameters()},
             {'params': self.model.decoder.parameters()}],
-            lr=1e-2, weight_decay=0.0,
-        )
+            lr=1e-2, weight_decay=0.0,)
+        self.optim_finetune = AdamW([
+            {'params': self.model.encoder.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
+            {'params': self.model.readout.parameters(), 'lr': 1e-2, 'weight_decay': 1e-2}],)
         self.optim_schedule_pretrain = CosineAnnealingLR(self.optim_pretrain, T_max=5, eta_min=1e-7)
-
-    def _setup_optim_finetune(self):
-        self.optim_finetune = Adamax([
-            {'params': self.model.encoder.parameters(), 'lr': 1e-4},
-            {'params': self.model.readout.parameters()}],
-            lr=1e-2, weight_decay=0.0,
-        )
-        self.optim_finetune = CosineAnnealingLR(self.optim_finetune, T_max=10, eta_min=1e-7)
+        self.optim_schedule_finetune = CosineAnnealingLR(self.optim_finetune, T_max=10, eta_min=1e-7)
 
     def _setup_data(self):
         supervised_dataset, unsupervised_dataset = create_datasets(

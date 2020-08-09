@@ -10,7 +10,6 @@ class Config:
         self,
             useful_cells: Dict[str, list] = None,
             grid_size: int = 15,
-            decoder_init_grid_size: int = 3,
             temporal_res: int = 25,
             time_lags: int = 12,
 
@@ -24,6 +23,7 @@ class Config:
             nb_decoder_units: List[int] = None,
             decoder_kernel_sizes: List[int] = None,
             decoder_strides: List[int] = None,
+            decoder_init_grid_size: int = 3,
 
             regularization: Dict[str, float] = None,
             dropout: float = 0.5,
@@ -35,7 +35,6 @@ class Config:
 
         # generic configs
         self.grid_size = grid_size
-        self.decoder_init_grid_size = decoder_init_grid_size
         self.temporal_res = temporal_res
         self.time_lags = time_lags
         self.hidden_size = hidden_size
@@ -67,6 +66,7 @@ class Config:
             self.decoder_strides = [2, 2, 1]
         else:
             self.decoder_strides = decoder_strides
+        self.decoder_init_grid_size = decoder_init_grid_size
 
         self.regularization = regularization
         self.dropout = dropout

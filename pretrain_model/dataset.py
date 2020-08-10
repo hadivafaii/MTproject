@@ -99,7 +99,7 @@ def normalize_fn(x, dim=None):
         return (x - x.mean(axis=dim, keepdims=True)) / x.std(axis=dim, keepdims=True)
 
 
-def create_datasets(config, xv_folds, rng):
+def create_datasets(config, xv_folds, rng, load_unsupervised=False):
     _dir = pjoin(config.base_dir, "pytorch_processed")
     files = os.listdir(_dir)
 
@@ -107,12 +107,14 @@ def create_datasets(config, xv_folds, rng):
         print('processed data found. loading . . .')
 
         supervised_final = joblib.load(pjoin(_dir, "supervised.sav"))
-        unsupervised_final = joblib.load(pjoin(_dir, "unsupervised.sav"))
-
         supervised_dataset = SupervisedDataset(supervised_final, config.time_lags, normalize_fn)
-        unsupervised_dataset = UnSupervisedDataset(unsupervised_final, config.time_lags, normalize_fn)
 
-        return supervised_dataset, unsupervised_dataset
+        if load_unsupervised:
+            unsupervised_final = joblib.load(pjoin(_dir, "unsupervised.sav"))
+            unsupervised_dataset = UnSupervisedDataset(unsupervised_final, config.time_lags, normalize_fn)
+            return supervised_dataset, unsupervised_dataset
+        else:
+            return supervised_dataset, None
 
     supervised_data_dict, unsupervised_data_dict = _load_data(config)
 
@@ -122,7 +124,6 @@ def create_datasets(config, xv_folds, rng):
         nt = len(data_dict['good_indxs'])
         train_inds, valid_inds = generate_xv_folds(nt, num_folds=xv_folds)
         rng.shuffle(train_inds)
-        rng.shuffle(valid_inds)
         data = {
             'stim': data_dict['stim'],
             'spks': data_dict['spks'],
@@ -169,7 +170,6 @@ def create_datasets(config, xv_folds, rng):
 
     train_inds, valid_inds = generate_xv_folds(len(good_indxs), num_folds=xv_folds, num_blocks=1)
     rng.shuffle(train_inds)
-    rng.shuffle(valid_inds)
 
     unsupervised_final = {
         'stim': stim_all.astype(float),

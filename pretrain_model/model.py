@@ -13,7 +13,7 @@ from torch.nn import functional as F
 from torch.nn.utils import weight_norm
 from torch.optim import Adam
 
-from .model_utils import print_num_params, get_activation_fn
+from .model_utils import print_num_params
 
 
 class MTNet(nn.Module):
@@ -24,7 +24,8 @@ class MTNet(nn.Module):
 
         self.encoder = ConvEncoder(config, verbose=verbose)
         self.decoder = FFDecoder(config, verbose=verbose)
-        self.readout = MTReadout(config, verbose=verbose)
+        # self.readout = MTReadout(config, verbose=verbose)
+        self.readout = MTReadoutLite(config, verbose=verbose)
 
         self.criterion_stim = nn.MSELoss(reduction="sum")
         self.criterion_spks = nn.PoissonNLLLoss(log_input=False, reduction="sum")
@@ -57,6 +58,52 @@ class MTNet(nn.Module):
             pass
 
 
+class MTReadoutFull(nn.Module):
+    def __init__(self, config, verbose=False):
+        super(MTReadoutFull, self).__init__()
+
+        if verbose:
+            print_num_params(self)
+
+    def forward(self, z, experiment_name: str):
+
+        return y
+
+
+class MTReadoutLite(nn.Module):
+    def __init__(self, config, verbose=False):
+        super(MTReadoutLite, self).__init__()
+
+        self.linear1 = nn.Linear(config.hidden_size, 4 * config.hidden_size, bias=True)
+        self.linear2 = nn.Linear(4 * config.hidden_size, config.hidden_size, bias=True)
+        self.net = nn.Sequential(
+            self.linear1, nn.ReLU(), nn.Dropout(config.dropout),
+            self.linear2, nn.ReLU(), nn.Dropout(config.dropout))
+        self.norm = nn.LayerNorm(config.hidden_size, config.layer_norm_eps)
+
+        layers = {}
+        for expt, good_channels in config.useful_cells.items():
+            layers.update({expt: nn.Linear(config.hidden_size, len(good_channels))})
+        self.layers = nn.ModuleDict(layers)
+
+        self.dropout = nn.Dropout(config.dropout)
+        self.softplus = nn.Softplus()
+
+        if verbose:
+            print_num_params(self)
+
+    def forward(self, z, experiment_name: str):
+        z = self.dropout(z)
+        x = self.net(z)
+        x = self.norm(x + z)
+
+        y = self.layers[experiment_name](x)
+        y = self.softplus(y)
+
+        return y
+
+
+# TODO: this is the original readout
 class MTReadout(nn.Module):
     def __init__(self, config, verbose=False):
         super(MTReadout, self).__init__()
@@ -76,8 +123,7 @@ class MTReadout(nn.Module):
             print_num_params(self)
 
     def forward(self, z, experiment_name: str):
-        x = self.linear(z)
-        x = self.relu(x)
+        x = self.relu(self.linear(z))
         x = self.norm(x)
         y = self.layers[experiment_name](x)
         y = self.softplus(y)
@@ -160,7 +206,7 @@ class ResNet(nn.Module):
     def __init__(self, config, verbose=False):
         super(ResNet, self).__init__()
 
-        self.inplanes = config.nb_rot_kernels * config.nb_rotations * config.nb_temporal_units
+        self.inplanes = config.nb_rot_kernels * config.nb_temporal_units * config.nb_rotations // 2
 
         self.layer1 = self._make_layer(BasicBlock, self.inplanes, blocks=2)
         self.layer2 = self._make_layer(BasicBlock, self.inplanes * 2, blocks=2, stride=2)
@@ -235,16 +281,22 @@ class RotationalConvBlock(nn.Module):
 
         padding = [k - 1 for k in config.rot_kernel_size]
         self.chomp3d = Chomp(chomp_sizes=padding, nb_dims=3)
-        self.rot_conv3d = RotConv3d(
+        self.conv1 = RotConv3d(
             in_channels=2,
             out_channels=config.nb_rot_kernels,
             nb_rotations=config.nb_rotations,
             kernel_size=config.rot_kernel_size,
             padding=padding,
             bias=False,)
-        self.bn = nn.BatchNorm3d(config.nb_rot_kernels * config.nb_rotations)
-        self.relu = nn.ReLU()
+        self.bn1 = nn.BatchNorm3d(config.nb_rot_kernels * config.nb_rotations)
+        self.relu1 = nn.ReLU()
         self.temporal_fc = nn.Linear(config.time_lags, config.nb_temporal_units, bias=False)
+
+        self.conv2 = conv1x1(config.nb_rot_kernels * config.nb_temporal_units * config.nb_rotations,
+                             config.nb_rot_kernels * config.nb_temporal_units * config.nb_rotations // 2)
+        self.bn2 = nn.BatchNorm2d(config.nb_rot_kernels * config.nb_temporal_units * config.nb_rotations // 2)
+        self.relu2 = nn.ReLU()
+
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         if verbose:
@@ -252,13 +304,20 @@ class RotationalConvBlock(nn.Module):
 
     def forward(self, x):
         # x : N x 2 x grd x grd x tau
-        x = self.chomp3d(self.rot_conv3d(x))  # N x C x grd x grd x tau
-        x = self.bn(x)
+        x = self.chomp3d(self.conv1(x))  # N x nb_rot_kers*nb_rot x grd x grd x tau
+        x = self.bn1(x)
         # TODO: experiment with exp nonlinearity
-        x = self.relu(x)
-        x = self.temporal_fc(x)  # N x C x grd x grd x nb_temporal_units
-        x = x.permute(0, 1, 4, 2, 3).flatten(start_dim=1, end_dim=2)  # N x C*nb_temporal_units x grd x grd
-        x_pool = self.maxpool(x)  # N x C*nb_temporal_units x grd//2 x grd//2
+        x = self.relu1(x)
+        x = self.temporal_fc(x)  # N x nb_rot_kers*nb_rot x grd x grd x nb_t_units
+        # TODO: should I take temporal fc before relu1 or after relu2?
+        # TODO: should I use 2 relus here, or just 1?
+        x = x.permute(0, 1, 4, 2, 3).flatten(start_dim=1, end_dim=2)  # N x nb_rot_kers*nb_rot*nb_t_units x grd x grd
+
+        x = self.conv2(x)  # N x nb_rot_kers*nb_t_units x grd x grd
+        x = self.bn2(x)
+        x = self.relu2(x)
+
+        x_pool = self.maxpool(x)  # N x nb_rot_kers*nb_rot*nb_t_units//2 x grd//2 x grd//2
 
         return x, x_pool
 

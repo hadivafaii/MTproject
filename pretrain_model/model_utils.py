@@ -23,10 +23,10 @@ def run_eval_loop(loaded_models: dict, batch_size: int = 512, base_dir: str = No
     assert len(loaded_models) - 1 == max(list(loaded_models.keys())), "Not all models are loaded"
 
     from .model import MTNet
-    from .training import MTTrainer
+    from .training import Trainer
 
     config = Config() if base_dir is None else Config(base_dir=base_dir)
-    base_trainer = MTTrainer(MTNet(config, verbose=False), TrainConfig(batch_size=batch_size))
+    base_trainer = Trainer(MTNet(config, verbose=False), TrainConfig(batch_size=batch_size))
 
     mean_train_nnll = np.zeros(len(loaded_models))
     mean_valid_nnll = np.zeros(len(loaded_models))
@@ -69,7 +69,7 @@ def run_eval_loop(loaded_models: dict, batch_size: int = 512, base_dir: str = No
     plt.plot([bst_median_idx, bst_median_idx],
              [min(min(median_train_nnll), min(median_valid_nnll)),
               max(max(median_train_nnll), max(median_valid_nnll))],
-             ls='--', label="best idx: {}".format(bst_mean_idx))
+             ls='--', label="best idx: {}".format(bst_median_idx))
     plt.legend()
     plt.grid()
     plt.show()
@@ -168,26 +168,15 @@ def print_num_params(module: nn.Module):
     print(t, '\n\n')
 
 
-def _get_nll(true, pred):
+def _get_nll(pred, true):
     _eps = np.finfo(np.float32).eps
     return np.sum(pred - true * np.log(pred + _eps), axis=0) / np.sum(true, axis=0)
 
 
-def get_null_adj_nll(true, pred):
-    nll = _get_nll(true, pred)
+def get_null_adj_nll(pred, true):
+    nll = _get_nll(pred, true)
 
     r_0 = true.mean(0)
-    null_nll = _get_nll(true, r_0)
+    null_nll = _get_nll(r_0, true)
 
     return -nll + null_nll
-
-
-def get_activation_fn(activation):
-    if activation == "relu":
-        return F.relu
-    if activation == "leaky_relu":
-        return F.leaky_relu
-    elif activation == "softplus":
-        return F.softplus
-    else:
-        raise RuntimeError("activation should be relu/leaky_relu/softplus, not {}".format(activation))

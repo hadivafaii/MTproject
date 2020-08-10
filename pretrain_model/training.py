@@ -14,13 +14,14 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 
-from .optimizer import Lamb, log_lamb_rs, ScheduledOptim
-from .dataset import create_datasets
-from .model_utils import save_model
+from .dataset import create_datasets, normalize_fn
+from .model_utils import save_model, get_null_adj_nll
+import sys; sys.path.append('..')
+from utils.generic_utils import to_np
 
 
 class Trainer:
-    def __init__(self, model, train_config, seed=665):
+    def __init__(self, model, train_config, seed=665, load_unsupervised=False):
         os.environ["SEED"] = str(seed)
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -39,6 +40,7 @@ class Trainer:
         self.unsupervised_dataset = None
         self.supervised_train_loader = None
         self.unsupervised_train_loader = None
+        self.load_unsupervised = load_unsupervised
         self._setup_data()
 
         self.writer = None
@@ -48,8 +50,6 @@ class Trainer:
         self.optim_schedule_pretrain = None
         self.optim_schedule_finetune = None
         self._setup_optim()
-
-        self._setup_optim_finetune()
 
         print("\nTotal Parameters:", sum([p.nelement() for p in self.model.parameters()]))
 
@@ -68,9 +68,9 @@ class Trainer:
             self.iteration(mode=mode, epoch=epoch)
 
             if (epoch + 1) % self.train_config.chkpt_freq == 0:
-                print('Saving chkpt:{:d}'.format(epoch+1))
+                print('Saving chkpt:{:d}'.format(epoch))
                 save_model(self.model,
-                           prefix='chkpt:{:d}'.format(epoch+1),
+                           prefix='chkpt:{:d}'.format(epoch),
                            comment=comment)
 
     def iteration(self, mode, epoch=0):
@@ -110,7 +110,11 @@ class Trainer:
                 final_loss = sum(x for x in loss_dict.values()) / len(loss_dict)
 
                 for k, v in loss_dict.items():
-                    msg1 += "{}: {:.3f}, ".format(k, v)
+                    msg1 += "{}: {:.3f}, ".format(k, v.item())
+                if (global_step + 1) % self.train_config.log_freq == 0:
+                    for k, v in loss_dict.items():
+                        self.writer.add_scalar('loss/{}'.format(k), v.item(), global_step)
+
             else:
                 raise RuntimeError("invalid mode value encountered: {}".format(mode))
 
@@ -163,80 +167,258 @@ class Trainer:
         elif mode == 'finetune':
             self.optim_schedule_finetune.step()
 
-    def generante_prediction(self, mode='train'):
+    def generante_prediction(self, mode='valid', batch_size=None):
         self.model.eval()
-        preds_dict = {}
 
+        if batch_size is None:
+            batch_size = self.train_config.batch_size
+
+        preds_dict = {}
         for expt in self.experiment_names:
             if mode == 'train':
-                indxs = self.dataset.train_indxs[expt]
+                indxs = self.supervised_dataset.train_indxs[expt]
             elif mode == 'valid':
-                indxs = self.dataset.valid_indxs[expt]
+                indxs = self.supervised_dataset.valid_indxs[expt]
             else:
                 raise ValueError("Invalid mode: {}".format(mode))
 
             src = []
             tgt = []
             for idx in indxs:
-                src.append(np.expand_dims(self.dataset.stim[expt][..., idx - self.config.time_lags: idx], axis=0))
-                tgt.append(np.expand_dims(self.dataset.spks[expt][idx], axis=0))
+                src.append(
+                    np.expand_dims(self.supervised_dataset.stim[expt][..., idx - self.config.time_lags: idx], axis=0))
+                tgt.append(np.expand_dims(self.supervised_dataset.spks[expt][idx], axis=0))
 
             src = np.concatenate(src).astype(float)
             tgt = np.concatenate(tgt).astype(float)
 
-            num_batches = int(np.ceil(len(indxs) / self.train_config.batch_size))
-            true_list = []
-            pred_list = []
+            num_batches = int(np.ceil(len(indxs) / batch_size))
+            pred_list, true_list = [], []
             for b in range(num_batches):
-                start = b * self.train_config.batch_size
-                end = min((b + 1) * self.train_config.batch_size, len(indxs))
+                start = b * batch_size
+                end = min((b + 1) * batch_size, len(indxs))
 
                 src_slice = src[range(start, end)]
                 original_shape = src_slice.shape
                 src_slice_normalized = normalize_fn(src_slice.reshape(original_shape[0], -1), dim=-1)
 
-                data_tuple = (src_slice_normalized.reshape(original_shape), tgt[range(start, end)])
-                data_tuple = tuple(map(lambda z: torch.tensor(z), data_tuple))
+                batch_src = torch.tensor(src_slice_normalized.reshape(original_shape))
+                batch_tgt = torch.tensor(tgt[range(start, end)])
+                batch_src, batch_tgt = _send_to_cuda((batch_src, batch_tgt), self.device)
 
-                batch_data_tuple = _send_to_cuda(data_tuple, self.device)
-                # TODO: make this only for finetune maybe?
                 with torch.no_grad():
-                    pred = self.model(batch_data_tuple[0], expt)
+                    pred = self.model(batch_src, expt)
 
-                true_list.append(batch_data_tuple[1])
                 pred_list.append(pred)
+                true_list.append(batch_tgt)
 
-            preds_dict.update({expt: (torch.cat(true_list), torch.cat(pred_list))})
+            preds_dict.update({expt: (to_np(torch.cat(pred_list)), to_np(torch.cat(true_list)))})
 
         return preds_dict
 
+    def extract_stim_features(self, batch_size=None):
+        self.model.eval()
+
+        if batch_size is None:
+            batch_size = self.train_config.batch_size
+
+        # train
+        train_x_dict = {}
+        train_z_dict = {}
+        train_tgt_dict = {}
+        train_indxs_dict = self.supervised_dataset.train_indxs
+        for expt in self.experiment_names:
+            src = []
+            tgt = []
+            for idx in train_indxs_dict[expt]:
+                src.append(np.expand_dims(
+                    self.supervised_dataset.stim[expt][..., idx - self.config.time_lags: idx], axis=0))
+                tgt.append(np.expand_dims(self.supervised_dataset.spks[expt][idx], axis=0))
+
+            src = np.concatenate(src).astype(float)
+            tgt = np.concatenate(tgt).astype(float)
+
+            data_tuple = (src, tgt)
+            data_tuple = tuple(map(lambda z: torch.tensor(z), data_tuple))
+            src, tgt = _send_to_cuda(data_tuple, self.device)
+
+            original_shape = src.shape
+            src_normalized = normalize_fn(src.reshape(original_shape[0], -1), dim=-1)
+            src = src_normalized.reshape(original_shape)
+
+            num_batches = int(np.floor(len(src) / batch_size))
+
+            x0_list = []
+            x1_list = []
+            x2_list = []
+            z_list = []
+            tgt_list = []
+            for b in range(num_batches):
+                start = b * batch_size
+                end = (b + 1) * batch_size
+
+                src_slice = src[range(start, end)]
+                tgt_slice = tgt[range(start, end)]
+
+                with torch.no_grad():
+                    (x0, x1, x2), z = self.model.encoder(src_slice)
+
+                x0_list.append(x0.cpu())
+                x1_list.append(x1.cpu())
+                x2_list.append(x2.cpu())
+                z_list.append(z.cpu())
+                tgt_list.append(tgt_slice.cpu())
+
+            train_x_dict.update({expt: (torch.cat(x0_list), torch.cat(x1_list), torch.cat(x2_list))})
+            train_z_dict.update({expt: torch.cat(z_list)})
+            train_tgt_dict.update({expt: torch.cat(tgt_list)})
+
+        output_train = {expt: (train_x_dict[expt], train_z_dict[expt], train_tgt_dict[expt]) for
+                        expt in self.experiment_names}
+
+        # valid
+        valid_x_dict = {}
+        valid_z_dict = {}
+        valid_tgt_dict = {}
+        valid_indxs_dict = self.supervised_dataset.valid_indxs
+        for expt in self.experiment_names:
+            src = []
+            tgt = []
+            for idx in valid_indxs_dict[expt]:
+                src.append(np.expand_dims(
+                    self.supervised_dataset.stim[expt][..., idx - self.config.time_lags: idx], axis=0))
+                tgt.append(np.expand_dims(self.supervised_dataset.spks[expt][idx], axis=0))
+
+            src = np.concatenate(src).astype(float)
+            tgt = np.concatenate(tgt).astype(float)
+
+            data_tuple = (src, tgt)
+            data_tuple = tuple(map(lambda z: torch.tensor(z), data_tuple))
+            src, tgt = _send_to_cuda(data_tuple, self.device)
+
+            original_shape = src.shape
+            src_normalized = normalize_fn(src.reshape(original_shape[0], -1), dim=-1)
+            src = src_normalized.reshape(original_shape)
+
+            num_batches = int(np.floor(len(src) / batch_size))
+
+            x0_list = []
+            x1_list = []
+            x2_list = []
+            z_list = []
+            tgt_list = []
+            for b in range(num_batches):
+                start = b * batch_size
+                end = (b + 1) * batch_size
+
+                src_slice = src[range(start, end)]
+                tgt_slice = tgt[range(start, end)]
+
+                with torch.no_grad():
+                    (x0, x1, x2), z = self.model.encoder(src_slice)
+
+                x0_list.append(x0.cpu())
+                x1_list.append(x1.cpu())
+                x2_list.append(x2.cpu())
+                z_list.append(z.cpu())
+                tgt_list.append(tgt_slice.cpu())
+
+            valid_x_dict.update({expt: (torch.cat(x0_list), torch.cat(x1_list), torch.cat(x2_list))})
+            valid_z_dict.update({expt: torch.cat(z_list)})
+            valid_tgt_dict.update({expt: torch.cat(tgt_list)})
+
+        output_valid = {expt: (valid_x_dict[expt], valid_z_dict[expt], valid_tgt_dict[expt]) for
+                        expt in self.experiment_names}
+
+        return output_train, output_valid
+
+    def evaluate_model(self, only_valid=True, print_table=False):
+        train_nnll, train_r2 = {}, {}
+        if not only_valid:
+            train_preds_dict = self.generante_prediction(mode='train')
+            for expt, (pred, true) in train_preds_dict.items():
+                train_nnll.update({expt: get_null_adj_nll(pred, true)})
+                train_r2.update({expt: r2_score(true, pred, multioutput='raw_values') * 100})
+        else:
+            train_preds_dict = {}
+
+        valid_nnll, valid_r2 = {}, {}
+        valid_preds_dict = self.generante_prediction(mode='valid')
+        for expt, (pred, true) in valid_preds_dict.items():
+            valid_nnll.update({expt: get_null_adj_nll(pred, true)})
+            valid_r2.update({expt: r2_score(true, pred, multioutput='raw_values') * 100})
+
+        if print_table:
+            t = PrettyTable(['Experiment Name', 'Channel', 'Train NNLL', 'Valid NNLL', 'Train R^2', 'Valid R^2'])
+
+            for expt, good_channels in self.config.useful_cells.items():
+                for idx, cc in enumerate(good_channels):
+                    t.add_row([
+                        expt, cc,
+                        np.round(train_nnll[expt][idx], 3),
+                        np.round(valid_nnll[expt][idx], 3),
+                        "{} {}".format(np.round(train_r2[expt][idx], 1), "%"),
+                        "{} {}".format(np.round(valid_r2[expt][idx], 1), "%"),
+                    ])
+
+            print(t)
+
+        train_nnll_all = [x for item in train_nnll.values() for x in item]
+        train_r2_all = [x for item in train_r2.values() for x in item]
+        if not only_valid:
+            msg = 'train: \t avg nnll: {:.4f}, \t median nnll: {:.4f}, \t avg r2: {:.2f} {},'
+            print(msg.format(np.mean(train_nnll_all), np.median(train_nnll_all), np.mean(train_r2_all), '%'))
+
+        valid_nnll_all = [x for item in valid_nnll.values() for x in item]
+        valid_r2_all = [x for item in valid_r2.values() for x in item]
+        msg = 'valid: \t avg nnll: {:.4f}, \t median nnll: {:.4f}, \t avg r2: {:.2f} {},'
+        print(msg.format(np.mean(valid_nnll_all), np.median(valid_nnll_all), np.mean(valid_r2_all), '%'))
+
+        output = {
+            "train_preds_dict": train_preds_dict,
+            "valid_preds_dict": valid_preds_dict,
+            "train_nnll": train_nnll, "valid_nnll": valid_nnll,
+            "train_nnll_all": train_nnll_all, "valid_nnll_all": valid_nnll_all,
+        }
+
+        return output
+
     def swap_model(self, new_model):
-        self.model = new_model.to(self.device)
+        self.model = new_model.to(self.device).eval()
         self.config = new_model.config
+        self._setup_optim()
 
     def _setup_data(self):
         supervised_dataset, unsupervised_dataset = create_datasets(
-            self.config, self.train_config.xv_folds, self.rng)
-        self.supervised_dataset = supervised_dataset
-        self.unsupervised_dataset = unsupervised_dataset
+            self.config, self.train_config.xv_folds, self.rng, self.load_unsupervised)
 
+        self.supervised_dataset = supervised_dataset
         self.supervised_train_loader = DataLoader(
             dataset=supervised_dataset,
             batch_size=self.train_config.batch_size,
-            drop_last=True,)
-        self.unsupervised_train_loader = DataLoader(
-            dataset=unsupervised_dataset,
-            batch_size=self.train_config.batch_size,
-            drop_last=True,)
+            shuffle=True, drop_last=True,)
+
+        if self.load_unsupervised:
+            self.unsupervised_dataset = unsupervised_dataset
+            self.unsupervised_train_loader = DataLoader(
+                dataset=unsupervised_dataset,
+                batch_size=self.train_config.batch_size,
+                shuffle=True, drop_last=True,)
 
     def _setup_optim(self):
         self.optim_pretrain = Adamax([
             {'params': self.model.encoder.parameters()},
             {'params': self.model.decoder.parameters()}],
-            lr=1e-2, weight_decay=0.0,)
+            lr=1e-2, weight_decay=0.0,
+        )
         self.optim_finetune = AdamW([
-            {'params': self.model.encoder.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
-            {'params': self.model.readout.parameters(), 'lr': 1e-2, 'weight_decay': 1e-2}],)
+            {'params': self.model.encoder.parameters(),
+             'lr': self.train_config.lr[0],
+             'weight_decay': self.train_config.weight_decay[0]},
+            {'params': self.model.readout.parameters(),
+             'lr': self.train_config.lr[1],
+             'weight_decay': self.train_config.weight_decay[1]}],
+        )
         self.optim_schedule_pretrain = CosineAnnealingLR(self.optim_pretrain, T_max=5, eta_min=1e-7)
         self.optim_schedule_finetune = CosineAnnealingLR(self.optim_finetune, T_max=10, eta_min=1e-7)
 

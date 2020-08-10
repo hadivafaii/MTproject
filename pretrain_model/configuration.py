@@ -117,30 +117,24 @@ class Config:
 class TrainConfig:
     def __init__(
             self,
-            optim_choice='adam_with_warmup',
-            lr=1e-3,
-            betas=(0.9, 0.999),
-            weight_decay: float = 0.01,
-            warmup_steps: int = 1000,
+            lr: Tuple[float, float] = (1e-4, 1e-2),
+            weight_decay: Tuple[float, float] = (1e-4, 1e-3),
+            scheduler_period: int = 10,
+            batch_size: int = 1024,
             use_cuda: bool = True,
             log_freq: int = 10,
             chkpt_freq: int = 1,
-            batch_size: int = 1024,
             xv_folds: int = 5,
             runs_dir: str = 'Documents/MT/runs',
     ):
         super(TrainConfig).__init__()
-        _allowed_optim_choices = ['lamb', 'adam', 'adam_with_warmup', 'adamax']
-        assert optim_choice in _allowed_optim_choices, "Invalid optimzer choice, allowed options:\n{}".format(_allowed_optim_choices)
-
-        self.optim_choice = optim_choice
         self.lr = lr
-        self.betas = betas
         self.weight_decay = weight_decay
-        self.warmup_steps = warmup_steps
+        self.scheduler_period = scheduler_period
+        self.batch_size = batch_size
+
         self.use_cuda = use_cuda
         self.log_freq = log_freq
         self.chkpt_freq = chkpt_freq
-        self.batch_size = batch_size
         self.xv_folds = xv_folds
         self.runs_dir = pjoin(os.environ['HOME'], runs_dir)

@@ -23,6 +23,7 @@ class MTNet(nn.Module):
         self.config = config
 
         self.encoder = ConvEncoder(config, verbose=verbose)
+        #self.decoder = ConvDecoder(config, verbose=verbose)
         self.decoder = FFDecoder(config, verbose=verbose)
         # self.readout = MTReadout(config, verbose=verbose)
         self.readout = MTReadoutLite(config, verbose=verbose)
@@ -155,8 +156,8 @@ class ConvDecoder(nn.Module):
         super(ConvDecoder, self).__init__()
 
         self.init_grid_size = config.decoder_init_grid_size
-        self.linear = nn.Linear(2 * config.hidden_size,
-                                config.nb_decoder_units[0] * self.init_grid_size * self.init_grid_size, bias=True)
+        self.linear = nn.Linear(
+            config.hidden_size, config.nb_decoder_units[0] * self.init_grid_size * self.init_grid_size, bias=True)
 
         layers = []
         for i in range(1, len(config.nb_decoder_units)):
@@ -167,10 +168,10 @@ class ConvDecoder(nn.Module):
                     kernel_size=config.decoder_kernel_sizes[i - 1],
                     stride=config.decoder_strides[i - 1],
                     bias=False,),
-                nn.LeakyReLU(negative_slope=config.leaky_negative_slope),
+                nn.ReLU(),
                 nn.Dropout(config.dropout),
             ])
-        self.net = nn.Sequential(*layers)
+        self.net = nn.Sequential(*layers[:-2])
 
         if verbose:
             print_num_params(self)
@@ -182,7 +183,7 @@ class ConvDecoder(nn.Module):
             self.init_grid_size, self.init_grid_size)
         x = self.net(x)
 
-        return x
+        return x.flatten(start_dim=1)
 
 
 class ConvEncoder(nn.Module):
@@ -196,10 +197,10 @@ class ConvEncoder(nn.Module):
             print_num_params(self)
 
     def forward(self, x):
-        x0, x = self.rot_layer(x)
-        x1, x2, x = self.resnet(x)
+        x1, x = self.rot_layer(x)
+        x2, x3, z = self.resnet(x)
 
-        return (x0, x1, x2), x
+        return (x1, x2, x3), z
 
 
 class ResNet(nn.Module):

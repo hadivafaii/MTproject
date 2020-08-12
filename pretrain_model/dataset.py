@@ -14,6 +14,41 @@ import seaborn as sns
 sns.set_style('dark')
 
 
+class ReadoutDataset(Dataset):
+    def __init__(self, data_dict, transform=None):
+
+        self.x = {expt: data[0] for (expt, data) in data_dict.items()}
+        self.z = {expt: data[1] for (expt, data) in data_dict.items()}
+        self.spks = {expt: data[2] for (expt, data) in data_dict.items()}
+
+        self.lengths = {expt: len(spks) for (expt, spks) in self.spks.items()}
+        self.transform = transform
+
+    def __len__(self):
+        return max(list(self.lengths.values()))
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        idx_dict = {expt: idx % length for (expt, length) in self.lengths.items()}
+
+        src_x = {
+            expt: tuple(x[idx_dict[expt]] for x in x_tup) for
+            (expt, x_tup) in self.x.items()
+        }
+        src_z = {
+            expt: z[idx_dict[expt]] for
+            (expt, z) in self.z.items()
+        }
+        tgt = {
+            expt: spks[idx_dict[expt]] for
+            (expt, spks) in self.spks.items()
+        }
+
+        return src_x, src_z, tgt
+
+
 class UnSupervisedDataset(Dataset):
     def __init__(self, data_dict, time_lage, transform=None):
 

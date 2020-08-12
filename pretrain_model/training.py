@@ -1,4 +1,5 @@
 import os
+import joblib
 import numpy as np
 from tqdm import tqdm
 from os.path import join as pjoin
@@ -14,7 +15,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 
-from .dataset import create_datasets, normalize_fn
+from .dataset import create_datasets, normalize_fn, ReadoutDataset
 from .model_utils import save_model, get_null_adj_nll
 import sys; sys.path.append('..')
 from utils.generic_utils import to_np
@@ -50,6 +51,9 @@ class Trainer:
         self.optim_schedule_pretrain = None
         self.optim_schedule_finetune = None
         self._setup_optim()
+
+        self.readout_train_loader = None
+        self.readout_valid_loader = None
 
         print("\nTotal Parameters:", sum([p.nelement() for p in self.model.parameters()]))
 
@@ -216,121 +220,111 @@ class Trainer:
 
         return preds_dict
 
-    def extract_stim_features(self, batch_size=None):
+    def create_readout_dataloaders(self, keyword, experiment, batch_size=None):
         self.model.eval()
 
         if batch_size is None:
             batch_size = self.train_config.batch_size
 
-        # train
-        train_x_dict = {}
-        train_z_dict = {}
-        train_tgt_dict = {}
-        train_indxs_dict = self.supervised_dataset.train_indxs
-        for expt in self.experiment_names:
-            src = []
-            tgt = []
-            for idx in train_indxs_dict[expt]:
-                src.append(np.expand_dims(
-                    self.supervised_dataset.stim[expt][..., idx - self.config.time_lags: idx], axis=0))
-                tgt.append(np.expand_dims(self.supervised_dataset.spks[expt][idx], axis=0))
+        output_train = self._xtract(keyword, experiment, "train", batch_size)
+        output_valid = self._xtract(keyword, experiment, "valid", batch_size)
 
-            src = np.concatenate(src).astype(float)
-            tgt = np.concatenate(tgt).astype(float)
+        self.readout_train_loader = DataLoader(
+            dataset=ReadoutDataset(output_train),
+            batch_size=self.train_config.batch_size,
+            shuffle=True, drop_last=True,)
+        self.readout_valid_loader = DataLoader(
+            dataset=ReadoutDataset(output_valid),
+            batch_size=self.train_config.batch_size,
+            shuffle=False, drop_last=True,)
 
-            data_tuple = (src, tgt)
-            data_tuple = tuple(map(lambda z: torch.tensor(z), data_tuple))
-            src, tgt = _send_to_cuda(data_tuple, self.device)
+    def _xtract(self, keyword, experiment, mode, batch_size):
+        _dir = pjoin(self.config.base_dir, "xtracted_features")
+        available_model_featrures = os.listdir(_dir)
 
-            original_shape = src.shape
-            src_normalized = normalize_fn(src.reshape(original_shape[0], -1), dim=-1)
-            src = src_normalized.reshape(original_shape)
+        for name in available_model_featrures:
+            if keyword == name:
+                break
 
-            num_batches = int(np.floor(len(src) / batch_size))
+        load_dir = pjoin(_dir, keyword, experiment)
+        load_file = pjoin(load_dir, "output_{}.sav".format(mode))
 
-            x0_list = []
-            x1_list = []
-            x2_list = []
-            z_list = []
-            tgt_list = []
-            for b in range(num_batches):
-                start = b * batch_size
-                end = (b + 1) * batch_size
+        try:
+            return joblib.load(load_file)
 
-                src_slice = src[range(start, end)]
-                tgt_slice = tgt[range(start, end)]
+        except FileNotFoundError:
+            msg = "no match found for:\nkeyword = {}\nexperiment={}\nmode = {}\nbuilding the data now"
+            print(msg.format(keyword, experiment, mode))
 
-                with torch.no_grad():
-                    (x0, x1, x2), z = self.model.encoder(src_slice)
+            if mode == "train":
+                indxs_dict = self.supervised_dataset.train_indxs
+            elif mode == "valid":
+                indxs_dict = self.supervised_dataset.valid_indxs
+            else:
+                raise RuntimeError("invalid mode encountered: {}".format(mode))
 
-                x0_list.append(x0.cpu())
-                x1_list.append(x1.cpu())
-                x2_list.append(x2.cpu())
-                z_list.append(z.cpu())
-                tgt_list.append(tgt_slice.cpu())
+            x_dict = {}
+            z_dict = {}
+            tgt_dict = {}
+            for expt in self.experiment_names:
+                if expt != experiment:
+                    continue
+                src = []
+                tgt = []
+                for idx in indxs_dict[expt]:
+                    src.append(np.expand_dims(
+                        self.supervised_dataset.stim[expt][..., idx - self.config.time_lags: idx], axis=0))
+                    tgt.append(np.expand_dims(self.supervised_dataset.spks[expt][idx], axis=0))
 
-            train_x_dict.update({expt: (torch.cat(x0_list), torch.cat(x1_list), torch.cat(x2_list))})
-            train_z_dict.update({expt: torch.cat(z_list)})
-            train_tgt_dict.update({expt: torch.cat(tgt_list)})
+                # ndarr
+                src = np.concatenate(src).astype(float)
+                tgt = np.concatenate(tgt).astype(float)
 
-        output_train = {expt: (train_x_dict[expt], train_z_dict[expt], train_tgt_dict[expt]) for
-                        expt in self.experiment_names}
+                # tensor
+                src, tgt = tuple(map(lambda z: torch.tensor(z), (src, tgt)))
 
-        # valid
-        valid_x_dict = {}
-        valid_z_dict = {}
-        valid_tgt_dict = {}
-        valid_indxs_dict = self.supervised_dataset.valid_indxs
-        for expt in self.experiment_names:
-            src = []
-            tgt = []
-            for idx in valid_indxs_dict[expt]:
-                src.append(np.expand_dims(
-                    self.supervised_dataset.stim[expt][..., idx - self.config.time_lags: idx], axis=0))
-                tgt.append(np.expand_dims(self.supervised_dataset.spks[expt][idx], axis=0))
+                # cuda
+                src = _send_to_cuda(src, self.device)[0]
+                original_shape = src.shape
+                src_normalized = normalize_fn(src.reshape(original_shape[0], -1), dim=-1)
+                src = src_normalized.reshape(original_shape)
 
-            src = np.concatenate(src).astype(float)
-            tgt = np.concatenate(tgt).astype(float)
+                num_batches = int(np.ceil(len(src) / batch_size))
 
-            data_tuple = (src, tgt)
-            data_tuple = tuple(map(lambda z: torch.tensor(z), data_tuple))
-            src, tgt = _send_to_cuda(data_tuple, self.device)
+                x1_list = []
+                x2_list = []
+                x3_list = []
+                z_list = []
+                for b in range(num_batches):
+                    start = b * batch_size
+                    end = min((b + 1) * batch_size, len(src))
 
-            original_shape = src.shape
-            src_normalized = normalize_fn(src.reshape(original_shape[0], -1), dim=-1)
-            src = src_normalized.reshape(original_shape)
+                    with torch.no_grad():
+                        (x1, x2, x3), z = self.model.encoder(src[range(start, end)])
 
-            num_batches = int(np.floor(len(src) / batch_size))
+                    x1_list.append(x1.cpu())
+                    x2_list.append(x2.cpu())
+                    x3_list.append(x3.cpu())
+                    z_list.append(z.cpu())
 
-            x0_list = []
-            x1_list = []
-            x2_list = []
-            z_list = []
-            tgt_list = []
-            for b in range(num_batches):
-                start = b * batch_size
-                end = (b + 1) * batch_size
+                x_dict.update({expt: (src.cpu(), torch.cat(x1_list), torch.cat(x2_list), torch.cat(x3_list))})
+                z_dict.update({expt: torch.cat(z_list)})
+                tgt_dict.update({expt: tgt.cpu()})
 
-                src_slice = src[range(start, end)]
-                tgt_slice = tgt[range(start, end)]
+            output = {expt: (
+                tuple(to_np(x) for x in x_dict[expt]),
+                to_np(z_dict[expt]),
+                to_np(tgt_dict[expt]),
+            ) for expt in self.experiment_names if expt == experiment}
 
-                with torch.no_grad():
-                    (x0, x1, x2), z = self.model.encoder(src_slice)
+            save_dir = pjoin(_dir, keyword, experiment)
+            os.makedirs(save_dir, exist_ok=True)
+            save_file = pjoin(save_dir, "output_{}.sav".format(mode))
+            print("saving:\n {}".format(save_file))
+            joblib.dump(output, save_file)
+            print("done!")
 
-                x0_list.append(x0.cpu())
-                x1_list.append(x1.cpu())
-                x2_list.append(x2.cpu())
-                z_list.append(z.cpu())
-                tgt_list.append(tgt_slice.cpu())
-
-            valid_x_dict.update({expt: (torch.cat(x0_list), torch.cat(x1_list), torch.cat(x2_list))})
-            valid_z_dict.update({expt: torch.cat(z_list)})
-            valid_tgt_dict.update({expt: torch.cat(tgt_list)})
-
-        output_valid = {expt: (valid_x_dict[expt], valid_z_dict[expt], valid_tgt_dict[expt]) for
-                        expt in self.experiment_names}
-
-        return output_train, output_valid
+            return output
 
     def evaluate_model(self, only_valid=True, print_table=False):
         train_nnll, train_r2 = {}, {}

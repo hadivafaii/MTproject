@@ -31,7 +31,6 @@ class Config:
             base_dir: str = 'Documents/PROJECTS/MT_LFP',
             data_file: str = None,
     ):
-        super(Config).__init__()
 
         # generic configs
         self.grid_size = grid_size
@@ -127,7 +126,7 @@ class TrainConfig:
             xv_folds: int = 5,
             runs_dir: str = 'Documents/MT/runs',
     ):
-        super(TrainConfig).__init__()
+
         self.lr = lr
         self.weight_decay = weight_decay
         self.scheduler_period = scheduler_period

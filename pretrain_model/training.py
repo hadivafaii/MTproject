@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 
 from .dataset import create_datasets, normalize_fn, ReadoutDataset
-from .model_utils import save_model, get_null_adj_nll
+from .model_utils import save_model, load_model, get_null_adj_nll
 import sys; sys.path.append('..')
 from utils.generic_utils import to_np
 
@@ -220,7 +220,22 @@ class Trainer:
 
         return preds_dict
 
-    def create_readout_dataloaders(self, keyword, experiment, batch_size=None):
+    def create_readout_dataloaders(self, keyword, experiment, batch_size=None, base_dir=None):
+        # load model
+        loaded_models = {}
+        for i in range(500):
+            try:
+                _model, metadata = load_model(keyword, i, verbose=False, base_dir=base_dir)
+                chkpt = int(metadata['chkpt'].split(':')[-1])
+                loaded_models.update({chkpt: _model})
+            except IndexError:
+                continue
+
+        test = sorted(loaded_models.items())[-1][-1]
+        if base_dir is not None:
+            test.config.base_dir = base_dir
+
+        self.swap_model(test)
         self.model.eval()
 
         if batch_size is None:

@@ -23,8 +23,8 @@ class MTNet(nn.Module):
         self.config = config
 
         self.encoder = ConvEncoder(config, verbose=verbose)
-        #self.decoder = ConvDecoder(config, verbose=verbose)
-        self.decoder = FFDecoder(config, verbose=verbose)
+        self.decoder = ConvDecoder(config, verbose=verbose)
+        # self.decoder = FFDecoder(config, verbose=verbose)
         # self.readout = MTReadout(config, verbose=verbose)
         self.readout = MTReadoutLite(config, verbose=verbose)
 
@@ -290,13 +290,13 @@ class RotationalConvBlock(nn.Module):
             padding=padding,
             bias=False,)
         self.bn1 = nn.BatchNorm3d(config.nb_rot_kernels * config.nb_rotations)
-        self.relu1 = nn.ReLU()
+        self.relu1 = nn.ReLU(inplace=True)
         self.temporal_fc = nn.Linear(config.time_lags, config.nb_temporal_units, bias=False)
 
         self.conv2 = conv1x1(config.nb_rot_kernels * config.nb_temporal_units * config.nb_rotations,
                              config.nb_rot_kernels * config.nb_temporal_units * config.nb_rotations // 2)
         self.bn2 = nn.BatchNorm2d(config.nb_rot_kernels * config.nb_temporal_units * config.nb_rotations // 2)
-        self.relu2 = nn.ReLU()
+        self.relu2 = nn.ReLU(inplace=True)
 
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
@@ -488,6 +488,24 @@ class Chomp(nn.Module):
             raise RuntimeError("Invalid number of dims")
 
 
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
     return nn.Conv2d(
         in_planes, out_planes, kernel_size=3, stride=stride,
@@ -496,3 +514,181 @@ def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
 
 def conv1x1(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False,)
+
+
+class ConvNIM(nn.Module):
+    def __init__(self, nb_kers, nb_tk, nb_sk, time_lags=12, rot_kernel_size=None):
+        super(ConvNIM, self).__init__()
+
+        if rot_kernel_size is None:
+            rot_kernel_size = [3, 3, 3]
+
+        padding = [k - 1 for k in rot_kernel_size]
+        self.chomp3d = Chomp(chomp_sizes=padding, nb_dims=3)
+        self.conv = RotConv3d(
+            in_channels=2,
+            out_channels=nb_kers,
+            nb_rotations=8,
+            kernel_size=rot_kernel_size,
+            padding=padding,
+            bias=False,)
+        self.relu = nn.ReLU(inplace=True)
+        self.temporal_fc = nn.Linear(time_lags, nb_tk, bias=False)
+        self.spatial_fc = nn.Linear(225, nb_sk, bias=False)
+
+        self.layer = nn.Linear(nb_kers * 8 * nb_tk * nb_sk, 12, bias=True)
+
+        self.criterion = nn.PoissonNLLLoss(log_input=False, reduction="sum")
+        self.softplus = nn.Softplus()
+
+        print_num_params(self)
+
+    def forward(self, x):
+        # x : N x 2 x grd x grd x tau
+        x = self.chomp3d(self.conv(x))  # N x nb_rot_kers*nb_rots x grd x grd x tau
+        x = self.temporal_fc(x)  # N x nb_rot_kers*nb_rots x grd x grd x nb_tk
+        x = self.relu(x)
+
+        x = x.flatten(start_dim=-3, end_dim=-2).permute(0, 1, 3, 2)
+        x = self.spatial_fc(x)  # N x nb_rot_kers*nb_rots x nb_tk x nb_sk
+        x = x.flatten(start_dim=1)  # N x filters
+
+        y = self.layer(x)
+        y = self.softplus(y)
+
+        return y
+
+
+class DirSelectiveNIM(nn.Module):
+    def __init__(self, nb_exc, nb_inh, nb_vel_tuning, nb_tk, nb_sk, time_lags=12):
+        super(DirSelectiveNIM, self).__init__()
+
+        self.dir_tuning = nn.Linear(2, nb_exc + nb_inh, bias=False)
+        self.vel_tuning = nn.Sequential(conv1x1(1, 32), nn.ReLU(),
+                                        conv1x1(32, 32), nn.ReLU(),
+                                        conv1x1(32, nb_vel_tuning), nn.ReLU(),)
+
+        self.temporal_kernels = nn.Linear(time_lags, nb_tk, bias=False)
+        self.spatial_kernels = nn.Linear(15 ** 2, nb_sk, bias=True)
+
+        self.layer = nn.Linear((nb_exc + nb_inh) * nb_vel_tuning * nb_sk * nb_tk, 12, bias=True)
+
+        self.reg = Regularizer(reg_values={'d2t': 1e-4, 'd2x': 1e-3},
+                               time_lags_list=[12],
+                               spatial_dims_list=[15])
+        self.criterion = nn.PoissonNLLLoss(log_input=False, reduction="sum")
+
+        self.relu = nn.ReLU(inplace=True)
+        self.softplus = nn.Softplus()
+
+        # self._load_vel_tuning()
+        print_num_params(self)
+
+    def forward(self, x):
+        x = x.permute(0, 4, 2, 3, 1)  # N x tau x grd x grd x 2
+        rho = torch.norm(x, dim=-1)
+
+        # angular component
+        f_theta = torch.exp(self.dir_tuning(x) / rho.masked_fill(rho == 0., 1e-8).unsqueeze(-1))  # N x tau x grd x grd x nb_exc+nb_inh
+
+        # radial component
+        original_shape = rho.size()  # N x tau x grd x grd
+        rho = rho.flatten(end_dim=1).unsqueeze(1)  # N*tau x 1 x grd x grd
+        f_r = self.vel_tuning(rho)  # N*tau x nb_vel_tuning x grd x grd
+        f_r = f_r.view(
+            original_shape[0], original_shape[1], -1, original_shape[-2], original_shape[-1])  # N x tau x nb_vel_tuning x grd x grd
+        f_r = f_r.permute(0, 1, 3, 4, 2)  # N x tau x grd x grd x nb_vel_tuning
+
+        # full subunit
+        subunit = torch.einsum('btijk, btijl -> btijkl', f_theta, f_r)  # N x tau x grd x grd x nb_exc+nb_inh x nb_vel_tuning
+        subunit = subunit.flatten(start_dim=-2)  # N x tau x grd x grd x (nb_exc+nb_inh)*nb_vel_tuning
+        subunit = subunit.permute(0, -1, 1, 2, 3)  # N x (nb_exc+nb_inh)*nb_vel_tuning x tau x grd x grd
+
+        # apply spatial and temporal kernels
+        z = self.spatial_kernels(subunit.flatten(start_dim=-2))  # N x (nb_exc+nb_inh)*nb_vel_tuning x tau x nb_sk
+        z = z.permute(0, 1, 3, 2)  # N x (nb_exc+nb_inh)*nb_vel_tuning x nb_sk x tau
+        z = self.temporal_kernels(z)  # N x (nb_exc+nb_inh)*nb_vel_tuning x nb_sk x nb_tk
+        z = z.flatten(start_dim=1)  # N x nb_filters
+        z = self.relu(z)
+
+        y = self.layer(z)
+        y = self.softplus(y)
+
+        return y
+
+    def _load_vel_tuning(self):
+        _dir = pjoin(os.environ['HOME'], 'Documents/PROJECTS/MT_LFP/vel_dir_weights')
+        try:
+            print('[INFO] loading vel tuning identity weights')
+            self.vel_tuning.load_state_dict(torch.load(pjoin(_dir, 'id_weights.bin')))
+        except (FileNotFoundError, RuntimeError):
+            print('[INFO] file does not exist, training from scratch')
+            self._train_vel_tuning()
+            os.makedirs(_dir, exist_ok=True)
+            torch.save(self.vel_tuning.state_dict(), pjoin(_dir, 'id_weights.bin'))
+
+    def _train_vel_tuning(self):
+        if torch.cuda.is_available():
+            self.cuda()
+
+        tmp_optim = Adam(self.vel_tuning.parameters())
+        loss_fn = nn.MSELoss()
+
+        ratio = 10
+        nb_epochs = 2000
+        batch_size = 8192
+        pbar = tqdm(range(nb_epochs))
+        for epoch in pbar:
+            tmp_data = torch.rand((batch_size, 1, self.config.grid_size, self.config.grid_size))
+            tmp_data = tmp_data * ratio - 0.02
+            tmp_data = tmp_data.cuda()
+
+            pred = self.vel_tuning(tmp_data)
+            loss = loss_fn(pred, tmp_data)
+
+            tmp_optim.zero_grad()
+            loss.backward()
+            tmp_optim.step()
+
+            pbar.set_description("epoch # {:d}, loss: {:.5f}".format(epoch, loss.item()))
+
+        print('[INFO] training vel tuning identity weights done')
+
+    def visualize(self, xv_nnll, xv_r2, save=False):
+        dir_tuning = self.dir_tuning.weight.data.flatten().cpu().numpy()
+        b_abs = np.linalg.norm(dir_tuning)
+        theta = np.arccos(dir_tuning[1] / b_abs)
+
+        tker = self.temporal_kernel.weight.data.flatten().cpu().numpy()
+        sker = self.spatial_kernel.weight.data.view(self.config.grid_size, self.config.grid_size).cpu().numpy()
+
+        if max(tker, key=abs) < 0:
+            tker *= -1
+            sker *= -1
+
+        sns.set_style('dark')
+        plt.figure(figsize=(16, 4))
+        plt.subplot(121)
+        t_rng = np.array([39, 36, 32, 27, 22, 15, 7, 0])
+        plt.xticks(t_rng, (self.config.time_lags - t_rng - 1) * -self.config.temporal_res)
+        plt.xlabel('Time (ms)', fontsize=25)
+        plt.plot(tker)
+        plt.grid()
+        plt.subplot(122)
+        plt.imshow(sker, cmap='bwr')
+        plt.colorbar()
+
+        plt.suptitle(
+            '$\\theta_p = $ %.2f deg,     b_abs = %.4f     . . .     xv_nnll:  %.4f,       xv_r2:  %.2f %s'
+            % (np.rad2deg(theta), b_abs, xv_nnll, xv_r2, '%'), fontsize=15)
+
+        if save:
+            result_save_dir = os.path.join(self.config.base_dir, 'results/PyTorch')
+            os.makedirs(result_save_dir, exist_ok=True)
+            save_name = os.path.join(
+                result_save_dir,
+                'DS_GLM_{:s}_{:s}.png'.format(self.config.experiment_names, datetime.now().strftime("[%Y_%m_%d_%H:%M]"))
+            )
+            plt.savefig(save_name, facecolor='white')
+
+        plt.show()

@@ -81,6 +81,61 @@ def plot_vel_field(data, fig_size=None, scale=None, save_file=None, estimate_cen
         return ctrs_all
 
 
+def create_animation(data, fps=10, scale=None, save_file=None):
+    # data has shape N X 2 x grd x grd
+    grd = data.shape[-1]
+    xx, yy = np.mgrid[0:grd, 0:grd]
+
+    uu, vv = data[0, 0], data[0, 1]
+    cc = np.sqrt(np.square(uu) + np.square(vv))
+
+    fig, ax = plt.subplots(nrows=1, ncols=3, figsize=(12, 2.5))
+
+    imx = ax[0].imshow(uu)
+    plt.colorbar(imx, ax=ax[0])
+    ax[0].set_xlabel('x')
+    ax[0].set_xlabel('y')
+    ax[0].set_xlim(-1, grd)
+    ax[0].set_ylim(-1, grd)
+
+    imy = ax[1].imshow(vv)
+    plt.colorbar(imy, ax=ax[1])
+    ax[1].set_xlabel('x')
+    ax[1].set_xlabel('y')
+    ax[1].set_xlim(-1, grd)
+    ax[1].set_ylim(-1, grd)
+
+    vel = ax[2].quiver(xx, yy, uu, vv, cc, alpha=1, cmap='PuBu', scale=scale)
+    plt.colorbar(vel, ax=ax[2])
+    sc = ax[2].scatter(xx, yy, s=0.005)
+    ax[2].set_xlim(-1, grd)
+    ax[2].set_ylim(-1, grd)
+    ax[2].set_aspect('equal')
+
+    # msg = 'Initial T = {:d},   max_steps = {:d}'
+    # plt.suptitle(msg.format(annealer.config.initial_temperature, annealer.config.max_steps), fontsize=20)
+
+    def update_fig(step):
+        current_uu, current_vv = data[step, 0], data[step, 1]
+        current_cc = np.sqrt(np.square(current_uu) + np.square(current_vv))
+
+        imx.set_data(current_uu)
+        imy.set_data(current_vv)
+        vel.set_UVC(current_uu, current_vv, current_cc)
+
+        return imx, imy, vel
+
+    ani = animation.FuncAnimation(fig, update_fig, len(data), interval=100, blit=True)
+    writer = animation.writers['ffmpeg'](fps=fps)
+
+    dpi = 100
+    if save_file is None:
+        save_file = 'animation.mp4'
+    ani.save(save_file, writer=writer, dpi=dpi)
+
+    return ani
+
+
 def make_gif(data_to_plot, frames=None, interval=120, dt=25, fig_sz=(8, 6), dpi=100, sns_style=None,
              cmap='Greys', mode='stim', scales=None, file_name=None, save_dir='./gifs/', row_n=None, col_n=None):
     if sns_style is not None:

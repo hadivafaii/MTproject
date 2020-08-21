@@ -22,8 +22,8 @@ class MTNet(nn.Module):
 
         self.config = config
 
-        self.encoder = ConvEncoder(config, verbose=verbose)
-        self.decoder = ConvDecoder(config, verbose=verbose)
+        self.encoder = Encoder(config, verbose=verbose)
+        self.decoder = Decoder(config, verbose=verbose)
         # self.decoder = FFDecoder(config, verbose=verbose)
         # self.readout = MTReadout(config, verbose=verbose)
         self.readout = MTReadoutLite(config, verbose=verbose)
@@ -50,7 +50,7 @@ class MTNet(nn.Module):
     @staticmethod
     def _init_weights(m):
         """ Initialize the weights """
-        if isinstance(m, (nn.Conv2d, nn.Conv3d, nn.ConvTranspose2d)):
+        if isinstance(m, (nn.Conv2d, nn.Conv3d, nn.ConvTranspose2d, nn.ConvTranspose3d)):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
         elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d, nn.LayerNorm)):
             nn.init.constant_(m.weight, 1.0)
@@ -75,16 +75,16 @@ class MTReadoutLite(nn.Module):
     def __init__(self, config, verbose=False):
         super(MTReadoutLite, self).__init__()
 
-        self.linear1 = nn.Linear(config.hidden_size, 4 * config.hidden_size, bias=True)
-        self.linear2 = nn.Linear(4 * config.hidden_size, config.hidden_size, bias=True)
+        self.linear1 = nn.Linear(config.z_dim, 4 * config.z_dim, bias=True)
+        self.linear2 = nn.Linear(4 * config.z_dim, config.z_dim, bias=True)
         self.net = nn.Sequential(
             self.linear1, nn.ReLU(), nn.Dropout(config.dropout),
             self.linear2, nn.ReLU(), nn.Dropout(config.dropout))
-        self.norm = nn.LayerNorm(config.hidden_size, config.layer_norm_eps)
+        self.norm = nn.LayerNorm(config.z_dim, config.layer_norm_eps)
 
         layers = {}
         for expt, good_channels in config.useful_cells.items():
-            layers.update({expt: nn.Linear(config.hidden_size, len(good_channels))})
+            layers.update({expt: nn.Linear(config.z_dim, len(good_channels))})
         self.layers = nn.ModuleDict(layers)
 
         self.dropout = nn.Dropout(config.dropout)
@@ -151,13 +151,13 @@ class FFDecoder(nn.Module):
         return x
 
 
-class ConvDecoder(nn.Module):
+class Decoder(nn.Module):
     def __init__(self, config, verbose=False):
-        super(ConvDecoder, self).__init__()
+        super(Decoder, self).__init__()
 
         self.init_grid_size = config.decoder_init_grid_size
         self.linear = nn.Linear(
-            config.hidden_size, config.nb_decoder_units[0] * self.init_grid_size * self.init_grid_size, bias=True)
+            config.z_dim, config.nb_decoder_units[0] * np.prod(self.init_grid_size), bias=True)
 
         layers = []
         for i in range(1, len(config.nb_decoder_units)):
@@ -179,52 +179,41 @@ class ConvDecoder(nn.Module):
     def forward(self, x):
         x = self.linear(x)
         x = x.view(
-            -1, self.linear.out_features // (self.init_grid_size ** 2),
-            self.init_grid_size, self.init_grid_size)
+            -1, self.linear.out_features // np.prod(self.init_grid_size),
+            self.init_grid_size[0], self.init_grid_size[1], self.init_grid_size[2])
         x = self.net(x)
 
         return x.flatten(start_dim=1)
 
 
-class ConvEncoder(nn.Module):
+class Encoder(nn.Module):
     def __init__(self, config, verbose=False):
-        super(ConvEncoder, self).__init__()
+        super(Encoder, self).__init__()
 
         self.rot_layer = RotationalConvBlock(config, verbose=verbose)
-        self.resnet = ResNet(config, verbose=verbose)
+        self.inplanes = config.nb_rot_kernels * config.nb_rotations
+        self.layer1 = self._make_layer(ConvBlock, self.inplanes * 2, blocks=2, stride=2)
+        self.layer2 = self._make_layer(ConvBlock, self.inplanes * 2, blocks=2, stride=2)
+
+        # self.resnet = ResNet(config, verbose=verbose)
 
         if verbose:
             print_num_params(self)
 
     def forward(self, x):
-        x1, x = self.rot_layer(x)
-        x2, x3, z = self.resnet(x)
+        x1 = self.rot_layer(x)
+        x2 = self.layer1(x1)
+        x3 = self.layer2(x2)
 
-        return (x1, x2, x3), z
-
-
-class ResNet(nn.Module):
-    def __init__(self, config, verbose=False):
-        super(ResNet, self).__init__()
-
-        self.inplanes = config.nb_rot_kernels * config.nb_temporal_units * config.nb_rotations // 2
-
-        self.layer1 = self._make_layer(BasicBlock, self.inplanes, blocks=2)
-        self.layer2 = self._make_layer(BasicBlock, self.inplanes * 2, blocks=2, stride=2)
-
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(self.inplanes, config.hidden_size)
-
-        if verbose:
-            print_num_params(self)
+        return x1, x2, x3
 
     def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
 
         if stride != 1 or self.inplanes != planes:
             downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes, stride),
-                nn.BatchNorm2d(planes),
+                conv1x1x1(self.inplanes, planes, stride),
+                nn.BatchNorm3d(planes),
             )
 
         layers = [block(self.inplanes, planes, stride, downsample)]
@@ -234,27 +223,18 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x):
-        x1 = self.layer1(x)
-        x2 = self.layer2(x1)
 
-        x = self.avgpool(x2)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-
-        return x1, x2, x
-
-
-class BasicBlock(nn.Module):
+class ConvBlock(nn.Module):
     def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(BasicBlock, self).__init__()
+        super(ConvBlock, self).__init__()
 
-        self.conv1 = conv3x3(inplanes, planes, stride)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
-        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv1 = conv3x3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm3d(planes)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3x3(planes, planes)
+        self.bn2 = nn.BatchNorm3d(planes)
         self.downsample = downsample
+        self.relu2 = nn.ReLU(inplace=True)
         self.stride = stride
 
     def forward(self, x):
@@ -262,7 +242,7 @@ class BasicBlock(nn.Module):
 
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.relu(out)
+        out = self.relu1(out)
 
         out = self.conv2(out)
         out = self.bn2(out)
@@ -271,7 +251,7 @@ class BasicBlock(nn.Module):
             identity = self.downsample(x)
 
         out += identity
-        out = self.relu(out)
+        out = self.relu2(out)
 
         return out
 
@@ -280,6 +260,7 @@ class RotationalConvBlock(nn.Module):
     def __init__(self, config, verbose=False):
         super(RotationalConvBlock, self).__init__()
 
+        nb_units = config.nb_rot_kernels * config.nb_rotations
         padding = [k - 1 for k in config.rot_kernel_size]
         self.chomp3d = Chomp(chomp_sizes=padding, nb_dims=3)
         self.conv1 = RotConv3d(
@@ -289,16 +270,11 @@ class RotationalConvBlock(nn.Module):
             kernel_size=config.rot_kernel_size,
             padding=padding,
             bias=False,)
-        self.bn1 = nn.BatchNorm3d(config.nb_rot_kernels * config.nb_rotations)
+        self.bn1 = nn.BatchNorm3d(nb_units)
         self.relu1 = nn.ReLU(inplace=True)
-        self.temporal_fc = nn.Linear(config.time_lags, config.nb_temporal_units, bias=False)
-
-        self.conv2 = conv1x1(config.nb_rot_kernels * config.nb_temporal_units * config.nb_rotations,
-                             config.nb_rot_kernels * config.nb_temporal_units * config.nb_rotations // 2)
-        self.bn2 = nn.BatchNorm2d(config.nb_rot_kernels * config.nb_temporal_units * config.nb_rotations // 2)
+        self.conv2 = conv3x3x3(nb_units, nb_units)
+        self.bn2 = nn.BatchNorm3d(nb_units)
         self.relu2 = nn.ReLU(inplace=True)
-
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         if verbose:
             print_num_params(self)
@@ -307,20 +283,13 @@ class RotationalConvBlock(nn.Module):
         # x : N x 2 x grd x grd x tau
         x = self.chomp3d(self.conv1(x))  # N x nb_rot_kers*nb_rot x grd x grd x tau
         x = self.bn1(x)
-        # TODO: experiment with exp nonlinearity
         x = self.relu1(x)
-        x = self.temporal_fc(x)  # N x nb_rot_kers*nb_rot x grd x grd x nb_t_units
-        # TODO: should I take temporal fc before relu1 or after relu2?
-        # TODO: should I use 2 relus here, or just 1?
-        x = x.permute(0, 1, 4, 2, 3).flatten(start_dim=1, end_dim=2)  # N x nb_rot_kers*nb_rot*nb_t_units x grd x grd
 
-        x = self.conv2(x)  # N x nb_rot_kers*nb_t_units x grd x grd
-        x = self.bn2(x)
-        x = self.relu2(x)
+        out = self.conv2(x)
+        out = self.bn2(out)
+        out = self.relu2(out + x)
 
-        x_pool = self.maxpool(x)  # N x nb_rot_kers*nb_rot*nb_t_units//2 x grd//2 x grd//2
-
-        return x, x_pool
+        return out
 
 
 class RotConv3d(nn.Conv3d):
@@ -491,7 +460,7 @@ class Chomp(nn.Module):
 class SELayer(nn.Module):
     def __init__(self, channel, reduction=16):
         super(SELayer, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
         self.fc = nn.Sequential(
             nn.Linear(channel, channel // reduction, bias=False),
             nn.ReLU(inplace=True),
@@ -500,20 +469,20 @@ class SELayer(nn.Module):
         )
 
     def forward(self, x):
-        b, c, _, _ = x.size()
+        b, c, _, _, _ = x.size()
         y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
+        y = self.fc(y).view(b, c, 1, 1, 1)
         return x * y.expand_as(x)
 
 
-def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
-    return nn.Conv2d(
+def conv3x3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+    return nn.Conv3d(
         in_planes, out_planes, kernel_size=3, stride=stride,
         padding=dilation, groups=groups, dilation=dilation, bias=False,)
 
 
-def conv1x1(in_planes, out_planes, stride=1):
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False,)
+def conv1x1x1(in_planes, out_planes, stride=1):
+    return nn.Conv3d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False,)
 
 
 class ConvNIM(nn.Module):

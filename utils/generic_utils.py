@@ -3,7 +3,7 @@ import torch
 import numpy as np
 from copy import deepcopy as dc
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
+from matplotlib import animation
 import seaborn as sns
 sns.set_style('white')
 
@@ -82,11 +82,11 @@ def plot_vel_field(data, fig_size=None, scale=None, save_file=None, estimate_cen
 
 
 def create_animation(data, fps=10, scale=None, save_file=None):
-    # data has shape N X 2 x grd x grd
-    grd = data.shape[-1]
-    xx, yy = np.mgrid[0:grd, 0:grd]
+    # data has shape 2 x grd x grd x N
+    _, grd_y, grd_x, nb_frames = data.shape
+    xx, yy = np.mgrid[0:grd_x, 0:grd_y]
 
-    uu, vv = data[0, 0], data[0, 1]
+    uu, vv = data[0, ..., 0], data[1, ..., 0]
     cc = np.sqrt(np.square(uu) + np.square(vv))
 
     fig, ax = plt.subplots(nrows=1, ncols=3, figsize=(12, 2.5))
@@ -95,28 +95,28 @@ def create_animation(data, fps=10, scale=None, save_file=None):
     plt.colorbar(imx, ax=ax[0])
     ax[0].set_xlabel('x')
     ax[0].set_xlabel('y')
-    ax[0].set_xlim(-1, grd)
-    ax[0].set_ylim(-1, grd)
+    # ax[0].set_xlim(-1, grd)
+    # ax[0].set_ylim(-1, grd)
 
     imy = ax[1].imshow(vv)
     plt.colorbar(imy, ax=ax[1])
     ax[1].set_xlabel('x')
     ax[1].set_xlabel('y')
-    ax[1].set_xlim(-1, grd)
-    ax[1].set_ylim(-1, grd)
+    # ax[1].set_xlim(-1, grd)
+    # ax[1].set_ylim(-1, grd)
 
     vel = ax[2].quiver(xx, yy, uu, vv, cc, alpha=1, cmap='PuBu', scale=scale)
     plt.colorbar(vel, ax=ax[2])
-    sc = ax[2].scatter(xx, yy, s=0.005)
-    ax[2].set_xlim(-1, grd)
-    ax[2].set_ylim(-1, grd)
+    _ = ax[2].scatter(xx, yy, s=0.005)
+    # ax[2].set_xlim(-1, grd)
+    # ax[2].set_ylim(-1, grd)
     ax[2].set_aspect('equal')
 
     # msg = 'Initial T = {:d},   max_steps = {:d}'
     # plt.suptitle(msg.format(annealer.config.initial_temperature, annealer.config.max_steps), fontsize=20)
 
     def update_fig(step):
-        current_uu, current_vv = data[step, 0], data[step, 1]
+        current_uu, current_vv = data[0, ..., step], data[1, ..., step]
         current_cc = np.sqrt(np.square(current_uu) + np.square(current_vv))
 
         imx.set_data(current_uu)
@@ -125,7 +125,7 @@ def create_animation(data, fps=10, scale=None, save_file=None):
 
         return imx, imy, vel
 
-    ani = animation.FuncAnimation(fig, update_fig, len(data), interval=100, blit=True)
+    ani = animation.FuncAnimation(fig, update_fig, nb_frames, interval=100, blit=True)
     writer = animation.writers['ffmpeg'](fps=fps)
 
     dpi = 100
@@ -166,9 +166,10 @@ def make_gif(data_to_plot, frames=None, interval=120, dt=25, fig_sz=(8, 6), dpi=
         fig.colorbar(_plt)
 
         # start anim object
-        anim = FuncAnimation(fig, _gif_update,
-                             fargs=[_plt, _ax, data_to_plot, dt, None, None, None, mode],
-                             frames=frames, interval=interval)
+        anim = animation.FuncAnimation(
+            fig, _gif_update,
+            fargs=[_plt, _ax, data_to_plot, dt, None, None, None, mode],
+            frames=frames, interval=interval)
         anim.save(save_dir + file_name, dpi=dpi, writer='imagemagick')
 
     elif mode == 'stim_multi':
@@ -200,9 +201,10 @@ def make_gif(data_to_plot, frames=None, interval=120, dt=25, fig_sz=(8, 6), dpi=
                 _plt_dict.update({'ax_%s_%s' % (ii, jj): tmp_plt})
 
         # start anim object
-        anim = FuncAnimation(fig, _gif_update,
-                             fargs=[fig, _plt_dict, data_to_plot, dt, None, row_n, col_n, mode],
-                             frames=frames, interval=interval)
+        anim = animation.FuncAnimation(
+            fig, _gif_update,
+            fargs=[fig, _plt_dict, data_to_plot, dt, None, row_n, col_n, mode],
+            frames=frames, interval=interval)
         anim.save(save_dir + file_name, dpi=dpi, writer='imagemagick')
 
     elif mode == 'velocity_field':
@@ -277,9 +279,10 @@ def make_gif(data_to_plot, frames=None, interval=120, dt=25, fig_sz=(8, 6), dpi=
                 _plt_dict.update({'ax_%s_%s' % (ii, jj): tmp_plt})
 
         # start anim object
-        anim = FuncAnimation(fig, _gif_update,
-                             fargs=[fig, _plt_dict, k, dt, scales, row_n, col_n, mode],
-                             frames=frames, interval=interval)
+        anim = animation.FuncAnimation(
+            fig, _gif_update,
+            fargs=[fig, _plt_dict, k, dt, scales, row_n, col_n, mode],
+            frames=frames, interval=interval)
         anim.save(save_dir + file_name, dpi=dpi, writer='imagemagick')
 
     elif mode == 'subs':
@@ -308,8 +311,10 @@ def make_gif(data_to_plot, frames=None, interval=120, dt=25, fig_sz=(8, 6), dpi=
                 _plt_dict.update({'ax_%s_%s' % (ii, jj): tmp_plt})
 
         # start anim object
-        anim = FuncAnimation(fig, _gif_update, fargs=[fig, _plt_dict, data_to_plot, dt, None, None, mode],
-                             frames=frames, interval=interval)
+        anim = animation.FuncAnimation(
+            fig, _gif_update,
+            fargs=[fig, _plt_dict, data_to_plot, dt, None, None, mode],
+            frames=frames, interval=interval)
         anim.save(save_dir + file_name, dpi=dpi, writer='imagemagick')
 
     else:

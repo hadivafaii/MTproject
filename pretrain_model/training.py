@@ -220,22 +220,25 @@ class Trainer:
 
         return preds_dict
 
-    def create_readout_dataloaders(self, keyword, experiment, batch_size=None, base_dir=None):
-        # load model
-        loaded_models = {}
-        for i in range(500):
-            try:
-                _model, metadata = load_model(keyword, i, verbose=False, base_dir=base_dir)
-                chkpt = int(metadata['chkpt'].split(':')[-1])
-                loaded_models.update({chkpt: _model})
-            except IndexError:
-                continue
+    def create_readout_dataloaders(self, keyword, experiment, from_pretrained=True, batch_size=None, base_dir=None):
+        if from_pretrained:
+            pint("loading pretrained model")
+            loaded_models = {}
+            for i in range(500):
+                try:
+                    _model, metadata = load_model(keyword, i, verbose=False, base_dir=base_dir)
+                    chkpt = int(metadata['chkpt'].split(':')[-1])
+                    loaded_models.update({chkpt: _model})
+                except IndexError:
+                    continue
 
-        test = sorted(loaded_models.items())[-1][-1]
-        if base_dir is not None:
-            test.config.base_dir = base_dir
+            mod = sorted(loaded_models.items())[-1][-1]
+            if base_dir is not None:
+                mod.config.base_dir = base_dir
+            self.swap_model(mod)
+        else:
+            print("using randomly initialized model")
 
-        self.swap_model(test)
         self.model.eval()
 
         if batch_size is None:
@@ -268,7 +271,7 @@ class Trainer:
             return joblib.load(load_file)
 
         except FileNotFoundError:
-            msg = "no match found for:\nkeyword = {}\nexperiment={}\nmode = {}\nbuilding the data now"
+            msg = "\nno match found for:\nkeyword = {}\nexperiment = {}\nmode = {}\nbuilding the data now"
             print(msg.format(keyword, experiment, mode))
 
             if mode == "train":
@@ -279,7 +282,6 @@ class Trainer:
                 raise RuntimeError("invalid mode encountered: {}".format(mode))
 
             x_dict = {}
-            z_dict = {}
             tgt_dict = {}
             for expt in self.experiment_names:
                 if expt != experiment:
@@ -309,26 +311,22 @@ class Trainer:
                 x1_list = []
                 x2_list = []
                 x3_list = []
-                z_list = []
                 for b in range(num_batches):
                     start = b * batch_size
                     end = min((b + 1) * batch_size, len(src))
 
                     with torch.no_grad():
-                        (x1, x2, x3), z = self.model.encoder(src[range(start, end)])
+                        x1, x2, x3 = self.model.encoder(src[range(start, end)])
 
                     x1_list.append(x1.cpu())
                     x2_list.append(x2.cpu())
                     x3_list.append(x3.cpu())
-                    z_list.append(z.cpu())
 
                 x_dict.update({expt: (src.cpu(), torch.cat(x1_list), torch.cat(x2_list), torch.cat(x3_list))})
-                z_dict.update({expt: torch.cat(z_list)})
                 tgt_dict.update({expt: tgt.cpu()})
 
             output = {expt: (
                 tuple(to_np(x) for x in x_dict[expt]),
-                to_np(z_dict[expt]),
                 to_np(tgt_dict[expt]),
             ) for expt in self.experiment_names if expt == experiment}
 
@@ -337,7 +335,7 @@ class Trainer:
             save_file = pjoin(save_dir, "output_{}.sav".format(mode))
             print("saving:\n {}".format(save_file))
             joblib.dump(output, save_file)
-            print("done!")
+            print("done!\n")
 
             return output
 

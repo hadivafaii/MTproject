@@ -18,8 +18,7 @@ class ReadoutDataset(Dataset):
     def __init__(self, data_dict, transform=None):
 
         self.x = {expt: data[0] for (expt, data) in data_dict.items()}
-        self.z = {expt: data[1] for (expt, data) in data_dict.items()}
-        self.spks = {expt: data[2] for (expt, data) in data_dict.items()}
+        self.spks = {expt: data[1] for (expt, data) in data_dict.items()}
 
         self.lengths = {expt: len(spks) for (expt, spks) in self.spks.items()}
         self.transform = transform
@@ -37,20 +36,16 @@ class ReadoutDataset(Dataset):
             expt: tuple(x[idx_dict[expt]] for x in x_tup) for
             (expt, x_tup) in self.x.items()
         }
-        src_z = {
-            expt: z[idx_dict[expt]] for
-            (expt, z) in self.z.items()
-        }
         tgt = {
             expt: spks[idx_dict[expt]] for
             (expt, spks) in self.spks.items()
         }
 
-        return src_x, src_z, tgt
+        return src_x, tgt
 
 
 class UnSupervisedDataset(Dataset):
-    def __init__(self, data_dict, time_lage, transform=None):
+    def __init__(self, data_dict, time_lags, time_gals, transform=None):
 
         self.stim = data_dict['stim']
         self.good_indxs = data_dict['good_indxs']
@@ -60,7 +55,8 @@ class UnSupervisedDataset(Dataset):
         assert not set(self.train_indxs).intersection(set(self.valid_indxs)), "train and valid indices must be disjoint"
         assert len(self.valid_indxs) + len(self.train_indxs) == len(self.good_indxs)
 
-        self.time_lags = time_lage
+        self.time_lags = time_lags
+        self.time_gals = time_gals
         self.transform = transform
 
     def __len__(self):
@@ -73,7 +69,7 @@ class UnSupervisedDataset(Dataset):
         i = self.good_indxs[self.train_indxs[idx]]
 
         source = self.stim[..., i - self.time_lags: i]
-        target = self.stim[..., i].flatten()
+        target = self.stim[..., i: i + self.time_gals]
 
         if self.transform is not None:
             source = self.transform(source)
@@ -83,14 +79,15 @@ class UnSupervisedDataset(Dataset):
 
 
 class SupervisedDataset(Dataset):
-    def __init__(self, data_dict, time_lage, transform=None):
+    def __init__(self, data_dict, time_lags, time_gals=1, transform=None):
 
         self.stim = {expt: data['stim'] for (expt, data) in data_dict.items()}
         self.spks = {expt: data['spks'] for (expt, data) in data_dict.items()}
         self.train_indxs = {expt: data['train_indxs'] for (expt, data) in data_dict.items()}
         self.valid_indxs = {expt: data['valid_indxs'] for (expt, data) in data_dict.items()}
 
-        self.time_lags = time_lage
+        self.time_lags = time_lags
+        self.time_gals = time_gals
         self.transform = transform
 
         self.lengths = {expt: len(item) for (expt, item) in self.train_indxs.items()}
@@ -109,11 +106,11 @@ class SupervisedDataset(Dataset):
             (expt, stim) in self.stim.items()
         }
         target_stim = {
-            expt: stim[..., self.train_indxs[expt][idx_dict[expt]]] for
+            expt: stim[..., self.train_indxs[expt][idx_dict[expt]]: self.train_indxs[expt][idx_dict[expt]] + self.time_gals] for
             (expt, stim) in self.stim.items()
         }
         target_spks = {
-            expt: spks[self.train_indxs[expt][idx_dict[expt]]] for
+            expt: spks[self.train_indxs[expt][idx_dict[expt]]: self.train_indxs[expt][idx_dict[expt]] + self.time_gals] for
             (expt, spks) in self.spks.items()
         }
 
@@ -142,11 +139,11 @@ def create_datasets(config, xv_folds, rng, load_unsupervised=False):
         print('processed data found. loading . . .')
 
         supervised_final = joblib.load(pjoin(_dir, "supervised.sav"))
-        supervised_dataset = SupervisedDataset(supervised_final, config.time_lags, normalize_fn)
+        supervised_dataset = SupervisedDataset(supervised_final, config.time_lags, config.time_gals, normalize_fn)
 
         if load_unsupervised:
             unsupervised_final = joblib.load(pjoin(_dir, "unsupervised.sav"))
-            unsupervised_dataset = UnSupervisedDataset(unsupervised_final, config.time_lags, normalize_fn)
+            unsupervised_dataset = UnSupervisedDataset(unsupervised_final, config.time_lags, config.time_gals, normalize_fn)
             return supervised_dataset, unsupervised_dataset
         else:
             return supervised_dataset, None
@@ -167,7 +164,7 @@ def create_datasets(config, xv_folds, rng, load_unsupervised=False):
         }
         supervised_final.update({expt: data})
     joblib.dump(supervised_final, pjoin(_dir, "supervised.sav"))
-    supervised_dataset = SupervisedDataset(supervised_final, config.time_lags, normalize_fn)
+    supervised_dataset = SupervisedDataset(supervised_final, config.time_lags, config.time_gals, normalize_fn)
 
     # unsupervised part
     stim_all = []
@@ -186,10 +183,10 @@ def create_datasets(config, xv_folds, rng, load_unsupervised=False):
             boundary_indxs = np.where(diff_mat @ zero_norm_indices != 1)[0]
 
             for i in range(len(boundary_indxs) - 1):
-                start = total_nt + zero_norm_indices[boundary_indxs[i]]
+                start = total_nt + zero_norm_indices[boundary_indxs[i]] - config.time_gals
                 end = total_nt + zero_norm_indices[boundary_indxs[i + 1] - 1] + config.time_lags
                 bad_indxs.extend(range(start, end))
-            start = total_nt + zero_norm_indices[boundary_indxs[-1]]
+            start = total_nt + zero_norm_indices[boundary_indxs[-1]] - config.time_gals
             end = total_nt + zero_norm_indices[-1] + config.time_lags
             bad_indxs.extend(range(start, end))
 
@@ -213,7 +210,7 @@ def create_datasets(config, xv_folds, rng, load_unsupervised=False):
         'valid_indxs': list(valid_inds),
     }
     joblib.dump(unsupervised_final, pjoin(_dir, "unsupervised.sav"))
-    unsupervised_dataset = UnSupervisedDataset(unsupervised_final, config.time_lags, normalize_fn)
+    unsupervised_dataset = UnSupervisedDataset(unsupervised_final, config.time_lags, config.time_gals, normalize_fn)
 
     return supervised_dataset, unsupervised_dataset
 

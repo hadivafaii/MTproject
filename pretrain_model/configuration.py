@@ -12,21 +12,20 @@ class Config:
             grid_size: int = 15,
             temporal_res: int = 25,
             time_lags: int = 12,
+            time_gals: int = 8,
 
-            hidden_size: int = 64,
+            z_dim: int = 8,
             rot_kernel_size: Union[int, List[int]] = 3,
             nb_rot_kernels: int = 16,
             nb_rotations: int = 8,
-            nb_temporal_units: int = 2,
 
-            nb_readout_spatial_units: List[int] = None,
             nb_decoder_units: List[int] = None,
             decoder_kernel_sizes: List[int] = None,
             decoder_strides: List[int] = None,
-            decoder_init_grid_size: int = 3,
+            decoder_init_grid_size: List[int] = None,
 
             regularization: Dict[str, float] = None,
-            dropout: float = 0.5,
+            dropout: float = 0.0,
             layer_norm_eps: float = 1e-12,
             base_dir: str = 'Documents/PROJECTS/MT_LFP',
             data_file: str = None,
@@ -36,7 +35,8 @@ class Config:
         self.grid_size = grid_size
         self.temporal_res = temporal_res
         self.time_lags = time_lags
-        self.hidden_size = hidden_size
+        self.time_gals = time_gals
+        self.z_dim = z_dim
 
         # encoder
         if isinstance(rot_kernel_size, int):
@@ -45,16 +45,10 @@ class Config:
             self.rot_kernel_size = rot_kernel_size
         self.nb_rot_kernels = nb_rot_kernels
         self.nb_rotations = nb_rotations
-        self.nb_temporal_units = nb_temporal_units
-
-        if nb_readout_spatial_units is None:
-            self.nb_readout_spatial_units = [128, 8, 2]
-        else:
-            self.nb_readout_spatial_units = nb_readout_spatial_units
 
         # decoder
         if nb_decoder_units is None:
-            self.nb_decoder_units = [256, 128, 64, 2]
+            self.nb_decoder_units = [256, 128, 64, 2 * time_gals]
         else:
             self.nb_decoder_units = nb_decoder_units
         if decoder_kernel_sizes is None:
@@ -65,7 +59,10 @@ class Config:
             self.decoder_strides = [2, 2, 1]
         else:
             self.decoder_strides = decoder_strides
-        self.decoder_init_grid_size = decoder_init_grid_size
+        if decoder_init_grid_size is None:
+            self.decoder_init_grid_size = [4, 4, 3]
+        else:
+            self.decoder_init_grid_size = decoder_init_grid_size
 
         self.regularization = regularization
         self.dropout = dropout

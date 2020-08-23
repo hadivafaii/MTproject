@@ -52,7 +52,7 @@ class UnSupervisedDataset(Dataset):
         self.train_indxs = data_dict['train_indxs']
         self.valid_indxs = data_dict['valid_indxs']
 
-        assert not set(self.train_indxs).intersection(set(self.valid_indxs)), "train and valid indices must be disjoint"
+        assert not set(self.train_indxs).intersection(set(self.valid_indxs)), "train/valid indices must be disjoint"
         assert len(self.valid_indxs) + len(self.train_indxs) == len(self.good_indxs)
 
         self.time_lags = time_lags
@@ -191,6 +191,7 @@ def create_datasets(config, xv_folds, rng, load_unsupervised=False):
             bad_indxs.extend(range(start, end))
 
         total_nt += nt
+        bad_indxs.extend(range(total_nt - config.time_gals - 1, total_nt))
         stim_all.append(v)
 
     good_indxs = set(range(total_nt)).difference(set(bad_indxs))

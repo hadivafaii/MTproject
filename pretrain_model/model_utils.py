@@ -109,7 +109,7 @@ def save_model(model, prefix=None, comment=None):
 
 
 def load_model(keyword, chkpt_id=-1, config=None, verbose=False, base_dir='Documents/PROJECTS/MT_LFP'):
-    from .model import MTNet
+    from .model import PredNVAE
 
     _dir = pjoin(os.environ['HOME'], base_dir, 'saved_models')
     available_models = os.listdir(_dir)
@@ -144,7 +144,7 @@ def load_model(keyword, chkpt_id=-1, config=None, verbose=False, base_dir='Docum
                 print(exc)
         config = Config(**config_dict)
 
-    loaded_model = MTNet(config, verbose=verbose)
+    loaded_model = PredNVAE(config, verbose=verbose)
     loaded_model.load_state_dict(torch.load(pjoin(load_dir, 'model.bin')))
 
     chkpt = load_dir.split("/")[-1].split("_")[0]

@@ -10,39 +10,54 @@ from typing import Tuple, Union
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.nn.utils import weight_norm
-from torch.optim import Adam
 
+from .common import *
 from .model_utils import print_num_params
 
 
-class MTNet(nn.Module):
+class PredNVAE(nn.Module):
     def __init__(self, config, verbose=False):
-        super(MTNet, self).__init__()
+        super(PredNVAE, self).__init__()
 
+        self.beta = 0.0
         self.config = config
 
         self.encoder = Encoder(config, verbose=verbose)
         self.decoder = Decoder(config, verbose=verbose)
-        # self.decoder = FFDecoder(config, verbose=verbose)
-        # self.readout = MTReadout(config, verbose=verbose)
-        self.readout = MTReadoutLite(config, verbose=verbose)
 
-        self.criterion_stim = nn.MSELoss(reduction="sum")
-        self.criterion_spks = nn.PoissonNLLLoss(log_input=False, reduction="sum")
-
+        self.recon_criterion = nn.MSELoss(reduction="sum")
         self.init_weights()
+
         if verbose:
             print_num_params(self)
 
-    def forward(self, src_stim, experiment_name: str = None):
-        _, z = self.encoder(src_stim)
+    def forward(self, src, tgt):
+        (X1, x2, x3, z1), (mu_x, logvar_x) = self.encoder(src)
+        (y1, y2, y3, z2), (mu_z, logvar_z), (mu_xz, logvar_xz) = self.decoder(z1, x2)
 
-        if experiment_name is None:
-            return self.decoder(z)
-        else:
-            # TODO: still not sure use z or the whole x_i gang for fine-tuning
-            return self.readout(z, experiment_name)
+        kl_x, kl_xz, recon_loss, loss = self._compute_loss(
+            y3, tgt, mu_x, mu_xz, logvar_z, logvar_x, logvar_xz)
+
+        return y3, (kl_x, kl_xz, recon_loss, loss)
+
+    def update_beta(self, new_beta):
+        assert 0.0 <= new_beta <= 1.0, "beta must be in [0, 1] interval"
+        self.beta = new_beta
+
+    def _compute_loss(self, recon, tgt, mu_x, mu_xz, logvar_z, logvar_x, logvar_xz):
+        kl_x = 0.5 * torch.sum(
+            torch.pow(mu_x, 2) + torch.exp(logvar_x) - logvar_x - 1
+        )
+        kl_xz = 0.5 * torch.sum(
+            torch.pow(mu_xz, 2) * torch.exp(-logvar_z) +
+            torch.exp(logvar_xz) - logvar_xz - 1
+        )
+
+        kl_loss = self.beta * (kl_x + kl_xz)
+        recon_loss = self.recon_criterion(recon, tgt)
+        loss = kl_loss + recon_loss
+
+        return kl_x, kl_xz, recon_loss, loss
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -50,25 +65,13 @@ class MTNet(nn.Module):
     @staticmethod
     def _init_weights(m):
         """ Initialize the weights """
-        if isinstance(m, (nn.Conv2d, nn.Conv3d, nn.ConvTranspose2d, nn.ConvTranspose3d)):
+        if isinstance(m, (nn.Conv3d, nn.ConvTranspose3d)):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d, nn.LayerNorm)):
+        elif isinstance(m, (nn.BatchNorm3d, nn.LayerNorm)):
             nn.init.constant_(m.weight, 1.0)
             nn.init.constant_(m.bias, 0.0)
         else:
             pass
-
-
-class MTReadoutFull(nn.Module):
-    def __init__(self, config, verbose=False):
-        super(MTReadoutFull, self).__init__()
-
-        if verbose:
-            print_num_params(self)
-
-    def forward(self, z, experiment_name: str):
-
-        return y
 
 
 class MTReadoutLite(nn.Module):
@@ -132,58 +135,122 @@ class MTReadout(nn.Module):
         return y
 
 
-class FFDecoder(nn.Module):
-    def __init__(self, config, verbose=False):
-        super(FFDecoder, self).__init__()
-
-        self.linear1 = nn.Linear(config.hidden_size, 128)
-        self.linear2 = nn.Linear(128, 2 * config.grid_size ** 2)
-
-        self.relu = nn.ReLU()
-        if verbose:
-            print_num_params(self)
-
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.relu(x)
-        x = self.linear2(x)
-
-        return x
-
-
 class Decoder(nn.Module):
     def __init__(self, config, verbose=False):
         super(Decoder, self).__init__()
 
-        self.init_grid_size = config.decoder_init_grid_size
-        self.linear = nn.Linear(
-            config.z_dim, config.nb_decoder_units[0] * np.prod(self.init_grid_size), bias=True)
+        self.z_dim = config.z_dim
+        self.inplanes = config.nb_rot_kernels * config.nb_rotations * 2 ** config.nb_lvls
 
-        layers = []
-        for i in range(1, len(config.nb_decoder_units)):
-            layers.extend([
-                nn.ConvTranspose2d(
-                    in_channels=config.nb_decoder_units[i - 1],
-                    out_channels=config.nb_decoder_units[i],
-                    kernel_size=config.decoder_kernel_sizes[i - 1],
-                    stride=config.decoder_strides[i - 1],
-                    bias=False,),
-                nn.ReLU(),
-                nn.Dropout(config.dropout),
-            ])
-        self.net = nn.Sequential(*layers[:-2])
+        self.init_size = (self.inplanes,) + tuple(config.decoder_init_grid_size)
+        self.fc1 = nn.Linear(config.z_dim, np.prod(self.init_size))
+        self.layer1 = self._make_layer(self.inplanes // 2, blocks=1, stride=2)
+        # TODO: set bais=False in proj1???
+        self.proj1 = nn.Sequential(
+            nn.ConvTranspose3d(self.inplanes, self.inplanes, 2),
+            nn.BatchNorm3d(self.inplanes), Swish(),)
+
+        self.intermediate_size = (self.inplanes,) + tuple(item * 2 for item in config.decoder_init_grid_size)
+        self.fc2 = nn.Linear(config.z_dim, np.prod(self.intermediate_size))
+        self.layer2 = self._make_layer(self.inplanes // 2, blocks=1, stride=2)
+        self.proj2 = deconv1x1x1(self.inplanes, 2)
+
+        # TODO: set bais=False in condition operators???
+        self.condition_z = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1), Swish(),
+            nn.Conv3d(self.inplanes * 2, config.z_dim * 2, 1),)
+        self.condition_xz = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1), Swish(),
+            nn.Conv3d(self.inplanes * 4, config.z_dim * 2, 1),)
 
         if verbose:
             print_num_params(self)
 
-    def forward(self, x):
-        x = self.linear(x)
-        x = x.view(
-            -1, self.linear.out_features // np.prod(self.init_grid_size),
-            self.init_grid_size[0], self.init_grid_size[1], self.init_grid_size[2])
-        x = self.net(x)
+    def forward(self, z1, x2):
+        # first layer
+        y1 = self.fc1(z1).view(-1, *self.init_size)
+        y1 = self.layer1(y1)
+        y2 = self.proj1(y1)
 
-        return x.flatten(start_dim=1)
+        # side path
+        mu_z, logvar_z = self.condition_z(y2).squeeze().chunk(2, dim=-1)
+        xy = torch.cat([y2, x2], dim=1)
+        mu_xz, logvar_xz = self.condition_xz(xy).squeeze().chunk(2, dim=-1)
+        z2 = reparametrize(mu_z + mu_xz, logvar_z + logvar_xz)
+        res = self.fc2(z2).view(-1, *self.intermediate_size)
+
+        # second layer
+        y2 = y2 + res
+        y2 = self.layer2(y2)
+        y3 = self.proj2(y2)
+
+        return (y1, y2, y3, z2), (mu_z, logvar_z), (mu_xz, logvar_xz)
+
+    def generate(self, num_samples):
+        self.eval()
+
+        z1 = torch.randn((num_samples, self.z_dim))
+        y1 = self.fc1(z1).view(num_samples, *self.init_size)
+        y1 = self.layer1(y1)
+        y2 = self.proj1(y1)
+
+        mu_z, logvar_z = self.condition_z(y2).squeeze().chunk(2, dim=-1)
+        z2 = reparametrize(mu_z, logvar_z)
+        res = self.fc2(z2).view(num_samples, *self.intermediate_size)
+
+        y2 = y2 + res
+        y2 = self.layer2(y2)
+        y3 = self.proj2(y2)
+
+        return z1, z2, res, y3
+
+    def _make_layer(self, planes, blocks, stride=1):
+        downsample = None
+
+        if stride != 1 or self.inplanes != planes:
+            downsample = nn.Sequential(
+                deconv1x1x1(self.inplanes, planes, stride),
+                nn.BatchNorm3d(planes),
+            )
+
+        layers = [DeConvBlock(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes
+        for _ in range(1, blocks):
+            layers.append(DeConvBlock(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+
+class DeConvBlock(nn.Module):
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(DeConvBlock, self).__init__()
+
+        self.deconv1 = deconv3x3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm3d(planes)
+        self.swish1 = Swish()
+        self.deconv2 = deconv3x3x3(planes, planes)
+        self.bn2 = nn.BatchNorm3d(planes)
+        self.downsample = downsample
+        self.swish2 = Swish()
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.deconv1(x)
+        out = self.bn1(out)
+        out = self.swish1(out)
+
+        out = self.deconv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.swish2(out)
+
+        return out
 
 
 class Encoder(nn.Module):
@@ -192,10 +259,13 @@ class Encoder(nn.Module):
 
         self.rot_layer = RotationalConvBlock(config, verbose=verbose)
         self.inplanes = config.nb_rot_kernels * config.nb_rotations
-        self.layer1 = self._make_layer(ConvBlock, self.inplanes * 2, blocks=2, stride=2)
-        self.layer2 = self._make_layer(ConvBlock, self.inplanes * 2, blocks=2, stride=2)
+        self.layer1 = self._make_layer(self.inplanes * 2, blocks=2, stride=2)
+        self.layer2 = self._make_layer(self.inplanes * 2, blocks=2, stride=2)
 
-        # self.resnet = ResNet(config, verbose=verbose)
+        # TODO: set bais=False in condition operators???
+        self.condition_x = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1), Swish(),
+            nn.Conv3d(self.inplanes, config.z_dim * 2, 1),)
 
         if verbose:
             print_num_params(self)
@@ -205,9 +275,12 @@ class Encoder(nn.Module):
         x2 = self.layer1(x1)
         x3 = self.layer2(x2)
 
-        return x1, x2, x3
+        mu_x, logvar_x = self.condition_x(x3).squeeze().chunk(2, dim=-1)
+        z1 = reparametrize(mu_x, logvar_x)
 
-    def _make_layer(self, block, planes, blocks, stride=1):
+        return (x1, x2, x3, z1), (mu_x, logvar_x)
+
+    def _make_layer(self, planes, blocks, stride=1):
         downsample = None
 
         if stride != 1 or self.inplanes != planes:
@@ -216,10 +289,10 @@ class Encoder(nn.Module):
                 nn.BatchNorm3d(planes),
             )
 
-        layers = [block(self.inplanes, planes, stride, downsample)]
+        layers = [ConvBlock(self.inplanes, planes, stride, downsample)]
         self.inplanes = planes
         for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes))
+            layers.append(ConvBlock(self.inplanes, planes))
 
         return nn.Sequential(*layers)
 
@@ -230,11 +303,12 @@ class ConvBlock(nn.Module):
 
         self.conv1 = conv3x3x3(inplanes, planes, stride)
         self.bn1 = nn.BatchNorm3d(planes)
-        self.relu1 = nn.ReLU(inplace=True)
+        self.swish1 = Swish()
         self.conv2 = conv3x3x3(planes, planes)
         self.bn2 = nn.BatchNorm3d(planes)
+        self.se = SELayer(planes, reduction=16)
         self.downsample = downsample
-        self.relu2 = nn.ReLU(inplace=True)
+        self.swish2 = Swish()
         self.stride = stride
 
     def forward(self, x):
@@ -242,16 +316,17 @@ class ConvBlock(nn.Module):
 
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.relu1(out)
+        out = self.swish1(out)
 
         out = self.conv2(out)
         out = self.bn2(out)
+        out = self.se(out)
 
         if self.downsample is not None:
             identity = self.downsample(x)
 
         out += identity
-        out = self.relu2(out)
+        out = self.swish2(out)
 
         return out
 
@@ -271,10 +346,11 @@ class RotationalConvBlock(nn.Module):
             padding=padding,
             bias=False,)
         self.bn1 = nn.BatchNorm3d(nb_units)
-        self.relu1 = nn.ReLU(inplace=True)
+        self.swish1 = Swish()
         self.conv2 = conv3x3x3(nb_units, nb_units)
         self.bn2 = nn.BatchNorm3d(nb_units)
-        self.relu2 = nn.ReLU(inplace=True)
+        self.se = SELayer(nb_units, reduction=8)
+        self.swish2 = Swish()
 
         if verbose:
             print_num_params(self)
@@ -283,11 +359,12 @@ class RotationalConvBlock(nn.Module):
         # x : N x 2 x grd x grd x tau
         x = self.chomp3d(self.conv1(x))  # N x nb_rot_kers*nb_rot x grd x grd x tau
         x = self.bn1(x)
-        x = self.relu1(x)
+        x = self.swish1(x)
 
         out = self.conv2(x)
         out = self.bn2(out)
-        out = self.relu2(out + x)
+        out = self.se(out)
+        out = self.swish2(out + x)
 
         return out
 
@@ -339,150 +416,7 @@ class RotConv3d(nn.Conv3d):
 
     def _get_augmented_weight(self):
         w = torch.einsum('jkn, inlmo -> ijklmo', self.rotation_mat, self.weight)
-        w = w.flatten(end_dim=1)
-        return w
-
-
-class Regularizer(nn.Module):
-    def __init__(self, reg_values: dict, time_lags_list: list, spatial_dims_list: list):
-        super(Regularizer, self).__init__()
-
-        assert len(time_lags_list) == len(spatial_dims_list)
-
-        self.time_lags_list = time_lags_list
-        self.spatial_dims_list = spatial_dims_list
-
-        self.lambda_d2t = reg_values['d2t']
-        self.lambda_d2x = reg_values['d2x']
-
-        self._register_reg_mats()
-
-    def _register_reg_mats(self):
-        d2t_reg_mats = []
-        d2x_reg_mats = []
-
-        for (time_lags, spatial_dim) in zip(self.time_lags_list, self.spatial_dims_list):
-            temporal_mat = (
-                    np.diag([1] * (time_lags - 1), k=-1) +
-                    np.diag([-2] * time_lags, k=0) +
-                    np.diag([1] * (time_lags - 1), k=1)
-            )
-
-            d1 = (
-                    np.diag([1] * (spatial_dim - 1), k=-1) +
-                    np.diag([-2] * spatial_dim, k=0) +
-                    np.diag([1] * (spatial_dim - 1), k=1)
-            )
-            spatial_mat = np.kron(np.eye(spatial_dim), d1) + np.kron(d1, np.eye(spatial_dim))
-
-            d2t_reg_mats.append(torch.tensor(temporal_mat, dtype=torch.float))
-            d2x_reg_mats.append(torch.tensor(spatial_mat, dtype=torch.float))
-
-        for i, mat in enumerate(d2t_reg_mats):
-            self.register_buffer("d2t_mat_{:d}".format(i), mat)
-        for i, mat in enumerate(d2x_reg_mats):
-            self.register_buffer("d2x_mat_{:d}".format(i), mat)
-
-    def compute_reg_loss(self, temporal_fcs: nn.ModuleList, spatial_fcs: nn.ModuleList):
-
-        assert len(temporal_fcs) == len(self.time_lags_list)
-        assert len(spatial_fcs) == len(self.spatial_dims_list)
-
-        d2t_losses = []
-        for i, layer in enumerate(temporal_fcs):
-            mat = getattr(self, "d2t_mat_{:d}".format(i))
-            d2t_losses.append(((layer.weight @ mat) ** 2).sum())
-        d2t_loss = self.lambda_d2t * sum(item for item in d2t_losses)
-
-        d2x_losses = []
-        for i, layer in enumerate(spatial_fcs):
-            w_size = layer.weight.size()
-            if len(w_size) == 2:
-                w = layer.weight
-            elif len(w_size) == 4:
-                w = layer.weight.flatten(end_dim=1).flatten(start_dim=1)
-            else:
-                raise RuntimeError("encountered tensor with size {}".format(w_size))
-            mat = getattr(self, "d2x_mat_{:d}".format(i))
-            d2x_losses.append(((w @ mat) ** 2).sum())
-
-        d2x_loss = self.lambda_d2x * sum(item for item in d2x_losses)
-
-        reg_losses = {'d2t': d2t_loss, 'd2x': d2x_loss}
-        return reg_losses
-
-
-class Chomp(nn.Module):
-    def __init__(self, chomp_sizes: Union[int, Tuple[int], Tuple[int, int], Tuple[int, int, int]], nb_dims):
-        super(Chomp, self).__init__()
-        if isinstance(chomp_sizes, int):
-            self.chomp_sizes = [chomp_sizes] * nb_dims
-        else:
-            self.chomp_sizes = chomp_sizes
-
-        assert len(self.chomp_sizes) == nb_dims, "must enter a chomp size for each dim"
-        self.nb_dims = nb_dims
-
-    def forward(self, x):
-        input_size = x.size()
-
-        if self.nb_dims == 1:
-            slice_d = slice(0, input_size[2] - self.chomp_sizes[0], 1)
-            return x[:, :, slice_d].contiguous()
-
-        elif self.nb_dims == 2:
-            if self.chomp_sizes[0] % 2 == 0:
-                slice_h = slice(self.chomp_sizes[0] // 2, input_size[2] - self.chomp_sizes[0] // 2, 1)
-            else:
-                slice_h = slice(0, input_size[2] - self.chomp_sizes[0], 1)
-            if self.chomp_sizes[2] % 2 == 0:
-                slice_w = slice(self.chomp_sizes[1] // 2, input_size[3] - self.chomp_sizes[1] // 2, 1)
-            else:
-                slice_w = slice(0, input_size[3] - self.chomp_sizes[1], 1)
-            return x[:, :, slice_h, slice_w].contiguous()
-
-        elif self.nb_dims == 3:
-            slice_d = slice(0, input_size[2] - self.chomp_sizes[0], 1)
-            if self.chomp_sizes[1] % 2 == 0:
-                slice_h = slice(self.chomp_sizes[1] // 2, input_size[3] - self.chomp_sizes[1] // 2, 1)
-            else:
-                slice_h = slice(0, input_size[3] - self.chomp_sizes[1], 1)
-            if self.chomp_sizes[2] % 2 == 0:
-                slice_w = slice(self.chomp_sizes[2] // 2, input_size[4] - self.chomp_sizes[2] // 2, 1)
-            else:
-                slice_w = slice(0, input_size[4] - self.chomp_sizes[2], 1)
-            return x[:, :, slice_d, slice_h, slice_w].contiguous()
-
-        else:
-            raise RuntimeError("Invalid number of dims")
-
-
-class SELayer(nn.Module):
-    def __init__(self, channel, reduction=16):
-        super(SELayer, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool3d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channel, channel // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channel // reduction, channel, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        b, c, _, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1, 1)
-        return x * y.expand_as(x)
-
-
-def conv3x3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
-    return nn.Conv3d(
-        in_planes, out_planes, kernel_size=3, stride=stride,
-        padding=dilation, groups=groups, dilation=dilation, bias=False,)
-
-
-def conv1x1x1(in_planes, out_planes, stride=1):
-    return nn.Conv3d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False,)
+        return w.flatten(end_dim=1)
 
 
 class ConvNIM(nn.Module):

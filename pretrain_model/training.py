@@ -10,10 +10,12 @@ from copy import deepcopy as dc
 
 import torch
 from torch import nn
+from torch.nn.utils import clip_grad_norm_
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
 from torch.optim import Adamax, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
-from tensorboardX import SummaryWriter
 
 from .dataset import create_datasets, normalize_fn, ReadoutDataset
 from .model_utils import save_model, load_model, get_null_adj_nll
@@ -67,6 +69,9 @@ class Trainer:
 
         self.model.train()
 
+        if self.train_config.beta_warmup_steps is None:
+            self.train_config.beta_warmup_steps = len(self.unsupervised_train_loader) * nb_epochs // 3
+
         epochs_range = range(nb_epochs) if isinstance(nb_epochs, int) else nb_epochs
         for epoch in epochs_range:
             self.iteration(mode=mode, epoch=epoch)
@@ -91,15 +96,34 @@ class Trainer:
         cuml_loss = 0.0
 
         for i, data in pbar:
-            msg0 = 'epoch {:d}'.format(epoch)
+            msg0 = 'epoch {:d}. '.format(epoch)
             msg1 = ""
             global_step = epoch * max_num_batches + i
 
             if mode == 'pretrain':
                 src, tgt = _send_to_cuda(data, self.device)
-                pred_stim = self.model(src)
-                final_loss = self.model.criterion_stim(pred_stim, tgt) / self.train_config.batch_size
+
+                if global_step > self.train_config.beta_warmup_steps:
+                    current_beta = 1.0
+                else:
+                    current_beta = global_step / self.train_config.beta_warmup_steps
+                self.model.update_beta(current_beta)
+                self.writer.add_scalar("beta", self.model.beta, global_step)
+
+                _, (kl_x, kl_xz, recon_loss, loss) = self.model(src, tgt)
+                final_loss = loss / self.train_config.batch_size
                 cuml_loss += final_loss.item()
+
+                _check_for_nans(src, tgt, loss, global_step)
+
+                if (global_step + 1) % self.train_config.log_freq == 0:
+                    self.writer.add_scalar("kl_terms/kl_x", kl_x.item(), global_step)
+                    self.writer.add_scalar("kl_terms/kl_xz", kl_xz.item(), global_step)
+                    self.writer.add_scalar("losses/recon_loss", recon_loss.item() / self.train_config.batch_size, global_step)
+                    self.writer.add_scalar("losses/tot_loss", final_loss.item(), global_step)
+
+                msg1 += "recon_loss: {:3f}, ".format(recon_loss.item() / self.train_config.batch_size)
+                msg1 += "tot_loss: {:3f}, ".format(final_loss.item())
 
             elif mode == 'finetune':
                 batch_data_dict = {expt: tuple(d[expt] for d in data) for expt in self.experiment_names}
@@ -115,6 +139,7 @@ class Trainer:
 
                 for k, v in loss_dict.items():
                     msg1 += "{}: {:.3f}, ".format(k, v.item())
+                msg1 += "tot: {:.3f}, ".format(final_loss.item())
                 if (global_step + 1) % self.train_config.log_freq == 0:
                     for k, v in loss_dict.items():
                         self.writer.add_scalar('loss/{}'.format(k), v.item(), global_step)
@@ -122,17 +147,16 @@ class Trainer:
             else:
                 raise RuntimeError("invalid mode value encountered: {}".format(mode))
 
-            if self.config.regularization is None:
-                msg1 += "tot: {:.3f}, ".format(final_loss.item())
+            # if self.config.regularization is None:
+            # msg1 += "tot: {:.3f}, ".format(final_loss.item())
+            # else:
+            # reg_losses_dict = self.model.readoud.regularizer.compute_reg_loss(
+            # self.model.encoder.temporal_fc, self.model.encoder_stim.spatial_fcs)
 
-            else:
-                reg_losses_dict = self.model.readoud.regularizer.compute_reg_loss(
-                    self.model.encoder.temporal_fc, self.model.encoder_stim.spatial_fcs)
+            # total_reg_loss = sum(x for x in reg_losses_dict.values())
+            # final_loss += total_reg_loss
 
-                total_reg_loss = sum(x for x in reg_losses_dict.values())
-                final_loss += total_reg_loss
-
-                msg1 += "tot reg: {:.2e}".format(total_reg_loss.item())
+            # msg1 += "tot reg: {:.2e}".format(total_reg_loss.item())
 
             desc1 = msg0 + '\t|\t' + msg1
             pbar.set_description(desc1)
@@ -141,6 +165,8 @@ class Trainer:
             if mode == 'pretrain':
                 self.optim_pretrain.zero_grad()
                 final_loss.backward()
+                if global_step < self.train_config.beta_warmup_steps:
+                    _ = clip_grad_norm_(self.model.parameters(), 0.25)
                 self.optim_pretrain.step()
                 self.writer.add_scalar('lr', self.optim_schedule_pretrain.get_last_lr()[0], global_step)
             elif mode == 'finetune':
@@ -163,8 +189,8 @@ class Trainer:
                 desc2 = msg0 + msg1
                 pbar.set_description(desc2)
 
-            if (global_step + 1) % self.train_config.log_freq == 0:
-                self.writer.add_scalar("tot_loss", final_loss.item(), global_step)
+            # if (global_step + 1) % self.train_config.log_freq == 0:
+            # self.writer.add_scalar("tot_loss", final_loss.item(), global_step)
 
         if mode == 'pretrain':
             self.optim_schedule_pretrain.step()
@@ -413,24 +439,24 @@ class Trainer:
                 shuffle=True, drop_last=True,)
 
     def _setup_optim(self):
-        self.optim_pretrain = Adamax([
-            {'params': self.model.encoder.parameters()},
-            {'params': self.model.decoder.parameters()}],
+        self.optim_pretrain = AdamW(
+            self.model.parameters(),
             lr=1e-2, weight_decay=0.0,
         )
-        self.optim_finetune = AdamW([
-            {'params': self.model.encoder.parameters(),
-             'lr': self.train_config.lr[0],
-             'weight_decay': self.train_config.weight_decay[0]},
-            {'params': self.model.readout.parameters(),
-             'lr': self.train_config.lr[1],
-             'weight_decay': self.train_config.weight_decay[1]}],
-        )
-        self.optim_schedule_pretrain = CosineAnnealingLR(self.optim_pretrain, T_max=5, eta_min=1e-7)
-        self.optim_schedule_finetune = CosineAnnealingLR(self.optim_finetune, T_max=10, eta_min=1e-7)
+        self.optim_schedule_pretrain = CosineAnnealingLR(
+            self.optim_pretrain, T_max=self.train_config.scheduler_period, eta_min=1e-7)
 
 
 def _send_to_cuda(data_tuple, device, dtype=torch.float32):
     if not isinstance(data_tuple, (tuple, list)):
         data_tuple = (data_tuple,)
     return tuple(map(lambda z: z.to(device=device, dtype=dtype, non_blocking=False), data_tuple))
+
+
+def _check_for_nans(src, tgt, loss, global_step):
+    if torch.isnan(src).sum().item():
+        raise RuntimeError("global_step = {}. nan encountered in src. moving on".format(global_step))
+    if torch.isnan(tgt).sum().item():
+        raise RuntimeError("global_step = {}. nan encountered in tgt. moving on".format(global_step))
+    if torch.isnan(loss).sum().item():
+        raise RuntimeError("global_step = {}. nan encountered in loss. moving on".format(global_step))

@@ -10,6 +10,7 @@ from copy import deepcopy as dc
 
 import torch
 from torch import nn
+from torch.cuda import amp
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -46,6 +47,7 @@ class Trainer:
         self.load_unsupervised = load_unsupervised
         self._setup_data()
 
+        self.grad_scaler = None
         self.writer = None
 
         self.optim_pretrain = None
@@ -63,6 +65,7 @@ class Trainer:
         assert isinstance(nb_epochs, (int, range)), "Please provide either range or int"
         assert mode in ['pretrain', 'finetune'], "wrong mode encountered"
 
+        self.grad_scaler = amp.GradScaler()
         self.writer = SummaryWriter(
             pjoin(self.train_config.runs_dir, "{}_{}".format(
                 comment, datetime.now().strftime("[%Y_%m_%d_%H:%M]"))))
@@ -110,17 +113,22 @@ class Trainer:
                 self.model.update_beta(current_beta)
                 self.writer.add_scalar("beta", self.model.beta, global_step)
 
-                _, (kl_x, kl_xz, recon_loss, loss) = self.model(src, tgt)
+                with amp.autocast():
+                    _, (kl_x, kl_xz, recon_loss, loss) = self.model(src, tgt)
                 final_loss = loss / self.train_config.batch_size
                 cuml_loss += final_loss.item()
 
                 _check_for_nans(src, tgt, loss, global_step)
 
                 if (global_step + 1) % self.train_config.log_freq == 0:
-                    self.writer.add_scalar("kl_terms/kl_x", kl_x.item(), global_step)
-                    self.writer.add_scalar("kl_terms/kl_xz", kl_xz.item(), global_step)
-                    self.writer.add_scalar("losses/recon_loss", recon_loss.item() / self.train_config.batch_size, global_step)
-                    self.writer.add_scalar("losses/tot_loss", final_loss.item(), global_step)
+                    self.writer.add_scalar(
+                        "kl_terms/kl_x", kl_x.item() / self.train_config.batch_size, global_step)
+                    self.writer.add_scalar(
+                        "kl_terms/kl_xz", kl_xz.item() / self.train_config.batch_size, global_step)
+                    self.writer.add_scalar(
+                        "losses/recon_loss", recon_loss.item() / self.train_config.batch_size, global_step)
+                    self.writer.add_scalar(
+                        "losses/tot_loss", final_loss.item(), global_step)
 
                 msg1 += "recon_loss: {:3f}, ".format(recon_loss.item() / self.train_config.batch_size)
                 msg1 += "tot_loss: {:3f}, ".format(final_loss.item())
@@ -164,10 +172,13 @@ class Trainer:
             # backward and optimization
             if mode == 'pretrain':
                 self.optim_pretrain.zero_grad()
-                final_loss.backward()
-                if global_step < self.train_config.beta_warmup_steps:
-                    _ = clip_grad_norm_(self.model.parameters(), 0.25)
-                self.optim_pretrain.step()
+                self.grad_scaler.scale(final_loss).backward()
+                # if global_step < self.train_config.beta_warmup_steps:
+                #     clip = 0.1 + 9.9 * global_step / self.train_config.beta_warmup_steps
+                #    _ = clip_grad_norm_(self.model.parameters(), clip)
+                self.grad_scaler.step(self.optim_pretrain)
+                self.grad_scaler.update()
+                # self.optim_pretrain.step()
                 self.writer.add_scalar('lr', self.optim_schedule_pretrain.get_last_lr()[0], global_step)
             elif mode == 'finetune':
                 self.optim_finetune.zero_grad()
@@ -342,7 +353,7 @@ class Trainer:
                     end = min((b + 1) * batch_size, len(src))
 
                     with torch.no_grad():
-                        x1, x2, x3 = self.model.encoder(src[range(start, end)])
+                        x1, x2, x3, _ = self.model.encoder(src[range(start, end)])[0]
 
                     x1_list.append(x1.cpu())
                     x2_list.append(x2.cpu())

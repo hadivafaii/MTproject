@@ -27,12 +27,13 @@ class PredNVAE(nn.Module):
 
         self.recon_criterion = nn.MSELoss(reduction="sum")
         self.init_weights()
+        self.apply(add_sn)
 
         if verbose:
             print_num_params(self)
 
     def forward(self, src, tgt):
-        (X1, x2, x3, z1), (mu_x, logvar_x) = self.encoder(src)
+        (x1, x2, x3, z1), (mu_x, logvar_x) = self.encoder(src)
         (y1, y2, y3, z2), (mu_z, logvar_z), (mu_xz, logvar_xz) = self.decoder(z1, x2)
 
         kl_x, kl_xz, recon_loss, loss = self._compute_loss(
@@ -142,33 +143,30 @@ class Decoder(nn.Module):
         self.z_dim = config.z_dim
         self.inplanes = config.nb_rot_kernels * config.nb_rotations * 2 ** config.nb_lvls
 
-        self.init_size = (self.inplanes,) + tuple(config.decoder_init_grid_size)
-        self.fc1 = nn.Linear(config.z_dim, np.prod(self.init_size))
+        self.init_size = tuple(config.decoder_init_grid_size)
+        self.expand1 = deconv1x1x1(config.z_dim, self.inplanes)
         self.layer1 = self._make_layer(self.inplanes // 2, blocks=1, stride=2)
-        # TODO: set bais=False in proj1???
         self.proj1 = nn.Sequential(
-            nn.ConvTranspose3d(self.inplanes, self.inplanes, 2),
+            nn.ConvTranspose3d(self.inplanes, self.inplanes, 2, bias=False),
             nn.BatchNorm3d(self.inplanes), Swish(),)
 
-        self.intermediate_size = (self.inplanes,) + tuple(item * 2 for item in config.decoder_init_grid_size)
-        self.fc2 = nn.Linear(config.z_dim, np.prod(self.intermediate_size))
+        self.intermediate_size = tuple(item * 2 for item in config.decoder_init_grid_size)
+        self.expand2 = deconv1x1x1(config.z_dim, self.inplanes)
         self.layer2 = self._make_layer(self.inplanes // 2, blocks=1, stride=2)
         self.proj2 = deconv1x1x1(self.inplanes, 2)
 
-        # TODO: set bais=False in condition operators???
         self.condition_z = nn.Sequential(
-            nn.AdaptiveAvgPool3d(1), Swish(),
-            nn.Conv3d(self.inplanes * 2, config.z_dim * 2, 1),)
+            nn.AdaptiveAvgPool3d(1), nn.Conv3d(self.inplanes * 2, config.z_dim * 2, 1))
         self.condition_xz = nn.Sequential(
-            nn.AdaptiveAvgPool3d(1), Swish(),
-            nn.Conv3d(self.inplanes * 4, config.z_dim * 2, 1),)
+            nn.AdaptiveAvgPool3d(1), nn.Conv3d(self.inplanes * 4, config.z_dim * 2, 1))
 
         if verbose:
             print_num_params(self)
 
     def forward(self, z1, x2):
-        # first layer
-        y1 = self.fc1(z1).view(-1, *self.init_size)
+        y1 = z1.view(-1, self.z_dim, 1, 1, 1)
+        y1 = y1.expand(-1, self.z_dim, *self.init_size)
+        y1 = self.expand1(y1)
         y1 = self.layer1(y1)
         y2 = self.proj1(y1)
 
@@ -177,7 +175,9 @@ class Decoder(nn.Module):
         xy = torch.cat([y2, x2], dim=1)
         mu_xz, logvar_xz = self.condition_xz(xy).squeeze().chunk(2, dim=-1)
         z2 = reparametrize(mu_z + mu_xz, logvar_z + logvar_xz)
-        res = self.fc2(z2).view(-1, *self.intermediate_size)
+        res = z2.view(-1, self.z_dim, 1, 1, 1)
+        res = res.expand(-1, self.z_dim, *self.intermediate_size)
+        res = self.expand2(res)
 
         # second layer
         y2 = y2 + res
@@ -262,10 +262,8 @@ class Encoder(nn.Module):
         self.layer1 = self._make_layer(self.inplanes * 2, blocks=2, stride=2)
         self.layer2 = self._make_layer(self.inplanes * 2, blocks=2, stride=2)
 
-        # TODO: set bais=False in condition operators???
         self.condition_x = nn.Sequential(
-            nn.AdaptiveAvgPool3d(1), Swish(),
-            nn.Conv3d(self.inplanes, config.z_dim * 2, 1),)
+            nn.AdaptiveAvgPool3d(1), nn.Conv3d(self.inplanes, config.z_dim * 2, 1))
 
         if verbose:
             print_num_params(self)

@@ -10,7 +10,7 @@ from copy import deepcopy as dc
 
 import torch
 from torch import nn
-from torch.cuda import amp
+# from torch.cuda import amp
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -47,7 +47,7 @@ class Trainer:
         self.load_unsupervised = load_unsupervised
         self._setup_data()
 
-        self.grad_scaler = None
+        # self.grad_scaler = None
         self.writer = None
 
         self.optim_pretrain = None
@@ -65,7 +65,7 @@ class Trainer:
         assert isinstance(nb_epochs, (int, range)), "Please provide either range or int"
         assert mode in ['pretrain', 'finetune'], "wrong mode encountered"
 
-        self.grad_scaler = amp.GradScaler()
+        # self.grad_scaler = amp.GradScaler()
         self.writer = SummaryWriter(
             pjoin(self.train_config.runs_dir, "{}_{}".format(
                 comment, datetime.now().strftime("[%Y_%m_%d_%H:%M]"))))
@@ -113,8 +113,8 @@ class Trainer:
                 self.model.update_beta(current_beta)
                 self.writer.add_scalar("beta", self.model.beta, global_step)
 
-                with amp.autocast():
-                    _, (kl_x, kl_xz, recon_loss, loss) = self.model(src, tgt)
+                # with amp.autocast():
+                _, (kl_x, kl_xz, recon_loss, loss) = self.model(src, tgt)
                 final_loss = loss / self.train_config.batch_size
                 cuml_loss += final_loss.item()
 
@@ -172,13 +172,14 @@ class Trainer:
             # backward and optimization
             if mode == 'pretrain':
                 self.optim_pretrain.zero_grad()
-                self.grad_scaler.scale(final_loss).backward()
+                final_loss.backward()
+                # self.grad_scaler.scale(final_loss).backward()
                 # if global_step < self.train_config.beta_warmup_steps:
                 #     clip = 0.1 + 9.9 * global_step / self.train_config.beta_warmup_steps
                 #    _ = clip_grad_norm_(self.model.parameters(), clip)
-                self.grad_scaler.step(self.optim_pretrain)
-                self.grad_scaler.update()
-                # self.optim_pretrain.step()
+                # self.grad_scaler.step(self.optim_pretrain)
+                # self.grad_scaler.update()
+                self.optim_pretrain.step()
                 self.writer.add_scalar('lr', self.optim_schedule_pretrain.get_last_lr()[0], global_step)
             elif mode == 'finetune':
                 self.optim_finetune.zero_grad()
@@ -259,7 +260,7 @@ class Trainer:
 
     def create_readout_dataloaders(self, keyword, experiment, from_pretrained=True, batch_size=None, base_dir=None):
         if from_pretrained:
-            pint("loading pretrained model")
+            print("loading pretrained model")
             loaded_models = {}
             for i in range(500):
                 try:
@@ -466,8 +467,8 @@ def _send_to_cuda(data_tuple, device, dtype=torch.float32):
 
 def _check_for_nans(src, tgt, loss, global_step):
     if torch.isnan(src).sum().item():
-        raise RuntimeError("global_step = {}. nan encountered in src. moving on".format(global_step))
+        raise RuntimeError("global_step = {}. nan encountered in src".format(global_step))
     if torch.isnan(tgt).sum().item():
-        raise RuntimeError("global_step = {}. nan encountered in tgt. moving on".format(global_step))
+        raise RuntimeError("global_step = {}. nan encountered in tgt".format(global_step))
     if torch.isnan(loss).sum().item():
-        raise RuntimeError("global_step = {}. nan encountered in loss. moving on".format(global_step))
+        print("WARNING: nan encountered in loss. optimizer will detect this and skip. step = {}".format(global_step))

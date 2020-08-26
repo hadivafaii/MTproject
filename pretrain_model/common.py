@@ -4,6 +4,10 @@ from torch.nn.utils import spectral_norm
 from typing import Tuple, Union
 
 
+def compute_endpoint_error(pred, tgt):
+    return torch.norm(pred-tgt, p=2, dim=1).sum()
+
+
 def add_sn(m):
     if isinstance(m, (nn.Conv3d, nn.ConvTranspose3d)):
         return spectral_norm(m)
@@ -49,9 +53,9 @@ def conv3x3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
         padding=dilation, groups=groups, dilation=dilation, bias=False,)
 
 
-def conv1x1x1(in_planes, out_planes, stride=1):
+def conv1x1x1(in_planes, out_planes, stride=1, bias=False):
     return nn.Conv3d(
-        in_planes, out_planes, kernel_size=1, stride=stride, bias=False,)
+        in_planes, out_planes, kernel_size=1, stride=stride, bias=bias,)
 
 
 def deconv3x3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
@@ -60,9 +64,9 @@ def deconv3x3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
         padding=dilation, groups=groups, dilation=dilation, bias=False,)
 
 
-def deconv1x1x1(in_planes, out_planes, stride=1):
+def deconv1x1x1(in_planes, out_planes, stride=1, bias=False):
     return nn.ConvTranspose3d(
-        in_planes, out_planes, kernel_size=1, stride=stride, bias=False,)
+        in_planes, out_planes, kernel_size=1, stride=stride, bias=bias,)
 
 
 class Chomp(nn.Module):

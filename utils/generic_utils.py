@@ -24,6 +24,49 @@ def convert_time(time_in_secs):
     print("\nd / hh:mm:ss   --->   %d / %d:%d:%d\n" % (d, h, m, s))
 
 
+def create_animation2(data, nrows, ncols, fps=10, figsize=(12, 2.5), scale=None, save_file=None):
+    # data has shape N x 2 x grd x grd x tau
+    num, _, grd_y, grd_x, nb_frames = data.shape
+    xx, yy = np.mgrid[0:grd_x, 0:grd_y]
+    assert num == nrows * ncols
+
+    fig, ax_arr = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize)
+
+    plots = ()
+    for i in range(nrows):
+        for j in range(ncols):
+            idx = i * ncols + j
+            uu, vv = data[idx, 0, ..., 0], data[idx, 1, ..., 0]
+            cc = np.sqrt(np.square(uu) + np.square(vv))
+
+            vel = ax_arr[i, j].quiver(xx, yy, uu, vv, cc, alpha=1, cmap='PuBu', scale=scale)
+            vel.axes.set_axis_off()
+            _ = ax_arr[i, j].scatter(xx, yy, s=0.005)
+            ax_arr[i, j].set_aspect('equal')
+
+            plots += (vel,)
+
+    def update_fig(step):
+        for i in range(nrows):
+            for j in range(ncols):
+                idx = i * ncols + j
+                current_uu, current_vv = data[idx, 0, ..., step], data[idx, 1, ..., step]
+                current_cc = np.sqrt(np.square(uu) + np.square(vv))
+                plots[idx].set_UVC(current_uu, current_vv, current_cc)
+
+        return plots
+
+    ani = animation.FuncAnimation(fig, update_fig, nb_frames, interval=100, blit=True)
+    writer = animation.writers['pillow'](fps=fps)
+
+    dpi = 200
+    if save_file is None:
+        save_file = 'animation.gif'
+    ani.save(save_file, writer=writer, dpi=dpi)
+
+    return ani
+
+
 def plot_vel_field(data, fig_size=None, scale=None, save_file=None, estimate_center=False):
     if torch.is_tensor(data):
         data = to_np(dc(data))

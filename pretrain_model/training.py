@@ -10,8 +10,6 @@ from copy import deepcopy as dc
 
 import torch
 from torch import nn
-# from torch.cuda import amp
-from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -25,7 +23,7 @@ from utils.generic_utils import to_np
 
 
 class Trainer:
-    def __init__(self, model, train_config, seed=665, load_unsupervised=False):
+    def __init__(self, model, train_config, seed=665, load_unsupervised=False, load_processed=True):
         os.environ["SEED"] = str(seed)
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -44,7 +42,10 @@ class Trainer:
         self.unsupervised_dataset = None
         self.supervised_train_loader = None
         self.unsupervised_train_loader = None
+        self.nardin_train_loader = None
+        self.nardin_valid_loader = None
         self.load_unsupervised = load_unsupervised
+        self.load_processed = load_processed
         self._setup_data()
 
         # self.grad_scaler = None
@@ -113,12 +114,15 @@ class Trainer:
                 self.model.update_beta(current_beta)
                 self.writer.add_scalar("beta", self.model.beta, global_step)
 
-                # with amp.autocast():
-                _, (kl_x, kl_xz, recon_loss, loss) = self.model(src, tgt)
+                if self.config.predictive_model:
+                    _, (kl_x, kl_xz, recon_loss, loss) = self.model(src, tgt)
+                else:
+                    _, (kl_x, kl_xz, recon_loss, loss) = self.model(src, src)
                 final_loss = loss / self.train_config.batch_size
                 cuml_loss += final_loss.item()
 
-                _check_for_nans(src, tgt, loss, global_step)
+                if _check_for_nans(src, tgt, loss, global_step):
+                    continue
 
                 if (global_step + 1) % self.train_config.log_freq == 0:
                     self.writer.add_scalar(
@@ -130,8 +134,8 @@ class Trainer:
                     self.writer.add_scalar(
                         "losses/tot_loss", final_loss.item(), global_step)
 
-                msg1 += "recon_loss: {:3f}, ".format(recon_loss.item() / self.train_config.batch_size)
-                msg1 += "tot_loss: {:3f}, ".format(final_loss.item())
+                msg1 += "recon_loss: {:.3f}, ".format(recon_loss.item() / self.train_config.batch_size)
+                msg1 += "tot_loss: {:.3f}, ".format(final_loss.item())
 
             elif mode == 'finetune':
                 batch_data_dict = {expt: tuple(d[expt] for d in data) for expt in self.experiment_names}
@@ -155,17 +159,6 @@ class Trainer:
             else:
                 raise RuntimeError("invalid mode value encountered: {}".format(mode))
 
-            # if self.config.regularization is None:
-            # msg1 += "tot: {:.3f}, ".format(final_loss.item())
-            # else:
-            # reg_losses_dict = self.model.readoud.regularizer.compute_reg_loss(
-            # self.model.encoder.temporal_fc, self.model.encoder_stim.spatial_fcs)
-
-            # total_reg_loss = sum(x for x in reg_losses_dict.values())
-            # final_loss += total_reg_loss
-
-            # msg1 += "tot reg: {:.2e}".format(total_reg_loss.item())
-
             desc1 = msg0 + '\t|\t' + msg1
             pbar.set_description(desc1)
 
@@ -173,12 +166,6 @@ class Trainer:
             if mode == 'pretrain':
                 self.optim_pretrain.zero_grad()
                 final_loss.backward()
-                # self.grad_scaler.scale(final_loss).backward()
-                # if global_step < self.train_config.beta_warmup_steps:
-                #     clip = 0.1 + 9.9 * global_step / self.train_config.beta_warmup_steps
-                #    _ = clip_grad_norm_(self.model.parameters(), clip)
-                # self.grad_scaler.step(self.optim_pretrain)
-                # self.grad_scaler.update()
                 self.optim_pretrain.step()
                 self.writer.add_scalar('lr', self.optim_schedule_pretrain.get_last_lr()[0], global_step)
             elif mode == 'finetune':
@@ -200,9 +187,6 @@ class Trainer:
                         np.mean(list(cuml_loss_dict.values())) / max_num_batches)
                 desc2 = msg0 + msg1
                 pbar.set_description(desc2)
-
-            # if (global_step + 1) % self.train_config.log_freq == 0:
-            # self.writer.add_scalar("tot_loss", final_loss.item(), global_step)
 
         if mode == 'pretrain':
             self.optim_schedule_pretrain.step()
@@ -259,8 +243,11 @@ class Trainer:
         return preds_dict
 
     def create_readout_dataloaders(self, keyword, experiment, from_pretrained=True, batch_size=None, base_dir=None):
+        if base_dir is None:
+            base_dir = self.config.base_dir
+
         if from_pretrained:
-            print("loading pretrained model")
+            print("pretrained model loaded")
             loaded_models = {}
             for i in range(500):
                 try:
@@ -271,8 +258,7 @@ class Trainer:
                     continue
 
             mod = sorted(loaded_models.items())[-1][-1]
-            if base_dir is not None:
-                mod.config.base_dir = base_dir
+            mod.config.base_dir = base_dir
             self.swap_model(mod)
         else:
             print("using randomly initialized model")
@@ -286,13 +272,15 @@ class Trainer:
         output_valid = self._xtract(keyword, experiment, "valid", batch_size)
 
         self.readout_train_loader = DataLoader(
-            dataset=ReadoutDataset(output_train),
+            dataset=ReadoutDataset(output_train, keyword, experiment, normalize_fn),
             batch_size=self.train_config.batch_size,
             shuffle=True, drop_last=True,)
         self.readout_valid_loader = DataLoader(
-            dataset=ReadoutDataset(output_valid),
+            dataset=ReadoutDataset(output_valid, keyword, experiment, normalize_fn),
             batch_size=self.train_config.batch_size,
             shuffle=False, drop_last=True,)
+
+        print("readout dataloaders successfully created!")
 
     def _xtract(self, keyword, experiment, mode, batch_size):
         _dir = pjoin(self.config.base_dir, "xtracted_features")
@@ -314,22 +302,41 @@ class Trainer:
 
             if mode == "train":
                 indxs_dict = self.supervised_dataset.train_indxs
+                loader = self.nardin_train_loader
             elif mode == "valid":
                 indxs_dict = self.supervised_dataset.valid_indxs
+                loader = self.nardin_valid_loader
             else:
                 raise RuntimeError("invalid mode encountered: {}".format(mode))
 
-            x_dict = {}
-            tgt_dict = {}
-            for expt in self.experiment_names:
-                if expt != experiment:
-                    continue
-                src = []
-                tgt = []
-                for idx in indxs_dict[expt]:
+            src = []
+            tgt = []
+            fltr = []
+            x1_list = []
+            x2_list = []
+            x3_list = []
+            if "nardin" in experiment:
+                for data in loader:
+                    batch_src = _send_to_cuda(data[0], self.device)[0]
+                    src.append(batch_src)
+                    tgt.append(data[1])
+                    fltr.append(data[2])
+
+                    with torch.no_grad():
+                        x1, x2, x3, _ = self.model.encoder(batch_src)[0]
+                    x1_list.append(x1.cpu())
+                    x2_list.append(x2.cpu())
+                    x3_list.append(x3.cpu())
+
+                src = torch.cat(src)
+                tgt = torch.cat(tgt)
+                fltr = torch.cat(fltr)
+
+            else:
+                for idx in indxs_dict[experiment]:
                     src.append(np.expand_dims(
-                        self.supervised_dataset.stim[expt][..., idx - self.config.time_lags: idx], axis=0))
-                    tgt.append(np.expand_dims(self.supervised_dataset.spks[expt][idx], axis=0))
+                        self.supervised_dataset.stim[experiment][..., idx - self.config.time_lags: idx], axis=0))
+                    tgt.append(np.expand_dims(self.supervised_dataset.spks[experiment][idx], axis=0))
 
                 # ndarr
                 src = np.concatenate(src).astype(float)
@@ -345,10 +352,6 @@ class Trainer:
                 src = src_normalized.reshape(original_shape)
 
                 num_batches = int(np.ceil(len(src) / batch_size))
-
-                x1_list = []
-                x2_list = []
-                x3_list = []
                 for b in range(num_batches):
                     start = b * batch_size
                     end = min((b + 1) * batch_size, len(src))
@@ -360,13 +363,16 @@ class Trainer:
                     x2_list.append(x2.cpu())
                     x3_list.append(x3.cpu())
 
-                x_dict.update({expt: (src.cpu(), torch.cat(x1_list), torch.cat(x2_list), torch.cat(x3_list))})
-                tgt_dict.update({expt: tgt.cpu()})
-
-            output = {expt: (
-                tuple(to_np(x) for x in x_dict[expt]),
-                to_np(tgt_dict[expt]),
-            ) for expt in self.experiment_names if expt == experiment}
+            output = {
+                "sources": (
+                    to_np(src),
+                    to_np(torch.cat(x1_list)),
+                    to_np(torch.cat(x2_list)),
+                    to_np(torch.cat(x3_list)),
+                ),
+                "target": to_np(tgt),
+                "filters": to_np(fltr),
+            }
 
             save_dir = pjoin(_dir, keyword, experiment)
             os.makedirs(save_dir, exist_ok=True)
@@ -434,14 +440,23 @@ class Trainer:
         self._setup_optim()
 
     def _setup_data(self):
-        supervised_dataset, unsupervised_dataset = create_datasets(
-            self.config, self.train_config.xv_folds, self.rng, self.load_unsupervised)
+        supervised_dataset, nardin_train, nardin_valid, unsupervised_dataset = create_datasets(
+            self.config, self.train_config.xv_folds, self.rng, self.load_unsupervised, self.load_processed)
 
         self.supervised_dataset = supervised_dataset
         self.supervised_train_loader = DataLoader(
             dataset=supervised_dataset,
             batch_size=self.train_config.batch_size,
             shuffle=True, drop_last=True,)
+
+        self.nardin_train_loader = DataLoader(
+            dataset=nardin_train,
+            batch_size=self.train_config.batch_size,
+            shuffle=True, drop_last=True,)
+        self.nardin_valid_loader = DataLoader(
+            dataset=nardin_valid,
+            batch_size=self.train_config.batch_size,
+            shuffle=False, drop_last=True,)
 
         if self.load_unsupervised:
             self.unsupervised_dataset = unsupervised_dataset
@@ -472,3 +487,4 @@ def _check_for_nans(src, tgt, loss, global_step):
         raise RuntimeError("global_step = {}. nan encountered in tgt".format(global_step))
     if torch.isnan(loss).sum().item():
         print("WARNING: nan encountered in loss. optimizer will detect this and skip. step = {}".format(global_step))
+        return True

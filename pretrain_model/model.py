@@ -145,7 +145,7 @@ class Decoder(nn.Module):
 
         self.init_size = tuple(config.decoder_init_grid_size)
         self.expand1 = nn.Sequential(
-            deconv1x1x1(config.z_dim, self.inplanes),
+            nn.ConvTranspose3d(config.z_dim, self.inplanes, self.init_size, bias=False),
             nn.BatchNorm3d(self.inplanes), Swish(),)
         self.layer1 = self._make_layer(self.inplanes // 2, blocks=1, stride=2)
         self.proj1 = nn.Sequential(
@@ -155,7 +155,7 @@ class Decoder(nn.Module):
         self.intermediate_size = tuple(item * 2 for item in config.decoder_init_grid_size)
         self.swish = Swish()
         self.expand2 = nn.Sequential(
-            deconv1x1x1(config.z_dim, self.inplanes),
+            nn.ConvTranspose3d(config.z_dim, self.inplanes, self.intermediate_size, bias=False),
             nn.BatchNorm3d(self.inplanes),)
         self.layer2 = self._make_layer(self.inplanes // 2, blocks=1, stride=2)
         self.proj2 = deconv1x1x1(self.inplanes, 2, bias=True)
@@ -170,7 +170,6 @@ class Decoder(nn.Module):
 
     def forward(self, z1, x2):
         y1 = z1.view(-1, self.z_dim, 1, 1, 1)
-        y1 = y1.expand(-1, self.z_dim, *self.init_size)
         y1 = self.expand1(y1)
         y1 = self.layer1(y1)
         y2 = self.proj1(y1)
@@ -181,7 +180,6 @@ class Decoder(nn.Module):
         mu_xz, logvar_xz = self.condition_xz(xy).squeeze().chunk(2, dim=-1)
         z2 = reparametrize(mu_z + mu_xz, logvar_z + logvar_xz)
         res = z2.view(-1, self.z_dim, 1, 1, 1)
-        res = res.expand(-1, self.z_dim, *self.intermediate_size)
         res = self.expand2(res)
 
         # second layer
@@ -191,17 +189,24 @@ class Decoder(nn.Module):
 
         return (y1, y2, y3, z2), (mu_z, logvar_z), (mu_xz, logvar_xz)
 
-    def generate(self, num_samples):
+    def generate(self, num_samples=None, z1=None):
         self.eval()
 
-        z1 = torch.randn((num_samples, self.z_dim))
-        y1 = self.fc1(z1).view(num_samples, *self.init_size)
+        if num_samples is None:
+            num_samples = 16
+
+        if z1 is None:
+            z1 = torch.randn((num_samples, self.z_dim))
+
+        y1 = z1.view(-1, self.z_dim, 1, 1, 1)
+        y1 = self.expand1(y1)
         y1 = self.layer1(y1)
         y2 = self.proj1(y1)
 
         mu_z, logvar_z = self.condition_z(y2).squeeze().chunk(2, dim=-1)
         z2 = reparametrize(mu_z, logvar_z)
-        res = self.fc2(z2).view(num_samples, *self.intermediate_size)
+        res = z2.view(-1, self.z_dim, 1, 1, 1)
+        res = self.expand2(res)
 
         y2 = self.swish(y2 + res)
         y2 = self.layer2(y2)

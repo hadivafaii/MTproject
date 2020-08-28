@@ -170,7 +170,7 @@ def print_num_params(module: nn.Module):
 
 def _get_nll(pred, true):
     _eps = np.finfo(np.float32).eps
-    return np.sum(pred - true * np.log(pred + _eps), axis=0) / np.sum(true, axis=0)
+    return np.sum(pred - true * np.log(pred + _eps), axis=0) / np.maximum(_eps, np.sum(true, axis=0))
 
 
 def get_null_adj_nll(pred, true):

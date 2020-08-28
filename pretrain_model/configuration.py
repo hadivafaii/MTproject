@@ -8,6 +8,7 @@ from typing import List, Tuple, Union, Dict
 class Config:
     def __init__(
         self,
+            predictive_model: bool = False,
             useful_cells: Dict[str, list] = None,
             temporal_res: int = 25,
             grid_size: int = 15,
@@ -16,19 +17,17 @@ class Config:
 
             z_dim: int = 8,
             nb_lvls: int = 2,
-            nb_rot_kernels: int = 16,
+            nb_rot_kernels: int = 4,
             nb_rotations: int = 8,
             rot_kernel_size: Union[int, List[int]] = 3,
             decoder_init_grid_size: List[int] = None,
 
-            # regularization: Dict[str, float] = None,
-            # dropout: float = 0.0,
-            # layer_norm_eps: float = 1e-12,
             base_dir: str = 'Documents/PROJECTS/MT_LFP',
             data_file: str = None,
     ):
 
         # generic configs
+        self.predictive_model = predictive_model
         self.temporal_res = temporal_res
         self.grid_size = grid_size
         self.time_lags = time_lags
@@ -50,14 +49,10 @@ class Config:
         else:
             self.decoder_init_grid_size = decoder_init_grid_size
 
-        # self.regularization = regularization
-        # self.dropout = dropout
-        # self.layer_norm_eps = layer_norm_eps
-
         # dir configs
         self.base_dir = pjoin(os.environ['HOME'], base_dir)
         if data_file is None:
-            self.data_file = pjoin(self.base_dir, 'python_processed','old_data_tres{:d}.h5'.format(temporal_res))
+            self.data_file = pjoin(self.base_dir, 'python_processed', 'old_data_tres{:d}.h5'.format(temporal_res))
         else:
             self.data_file = data_file
 

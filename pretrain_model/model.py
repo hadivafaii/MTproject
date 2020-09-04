@@ -19,7 +19,7 @@ class PredNVAE(nn.Module):
     def __init__(self, config, verbose=False):
         super(PredNVAE, self).__init__()
 
-        self.beta = 0.0
+        self.beta = 1.0
         self.config = config
 
         self.encoder = Encoder(config, verbose=verbose)

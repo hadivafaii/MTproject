@@ -52,7 +52,7 @@ class ReadoutDataset(Dataset):
             fltr = self.filters[idx]
             return src_x, tgt, fltr
         else:
-            return src_x, tgt, None
+            return src_x, tgt
 
 
 class NardinDataset(Dataset):
@@ -301,7 +301,7 @@ def _load_nardin_data(config):
     info = pd.read_pickle(pjoin(path, "info_w_ctrs_w_fr.pd"))
     info['2_name'] = np.array(info['2_name']).astype('str')
 
-    threshold_fr = 3.0
+    threshold_fr = 0.1
     good_cells = list(info['4_fr'] > threshold_fr)
     info = info[good_cells]
     info = info.reset_index()

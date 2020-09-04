@@ -3,28 +3,19 @@ import torch
 import numpy as np
 from copy import deepcopy as dc
 import matplotlib.pyplot as plt
+from sklearn.metrics import mutual_info_score
 from matplotlib import animation
 import seaborn as sns
 sns.set_style('white')
 
 
-def to_np(x):
-    if isinstance(x, np.ndarray):
-        return x
-    return x.data.cpu().numpy()
+def compute_mi(x, y, bins):
+    c_xy = np.histogram2d(x, y, bins)[0]
+    mi = mutual_info_score(None, None, contingency=c_xy)
+    return mi, c_xy
 
 
-def convert_time(time_in_secs):
-
-    d = time_in_secs // 86400
-    h = (time_in_secs - d * 86400) // 3600
-    m = (time_in_secs - d * 86400 - h * 3600) // 60
-    s = time_in_secs - d * 86400 - h * 3600 - m * 60
-
-    print("\nd / hh:mm:ss   --->   %d / %d:%d:%d\n" % (d, h, m, s))
-
-
-def create_animation2(data, nrows, ncols, fps=10, figsize=(12, 2.5), scale=None, save_file=None):
+def create_animation2(data, nrows, ncols, fps=10, figsize=(12, 2.5), dpi=100, scale=None, save_file=None):
     # data has shape N x 2 x grd x grd x tau
     num, _, grd_y, grd_x, nb_frames = data.shape
     xx, yy = np.mgrid[0:grd_x, 0:grd_y]
@@ -51,17 +42,16 @@ def create_animation2(data, nrows, ncols, fps=10, figsize=(12, 2.5), scale=None,
             for j in range(ncols):
                 idx = i * ncols + j
                 current_uu, current_vv = data[idx, 0, ..., step], data[idx, 1, ..., step]
-                current_cc = np.sqrt(np.square(uu) + np.square(vv))
+                current_cc = np.sqrt(np.square(current_uu) + np.square(current_vv))
                 plots[idx].set_UVC(current_uu, current_vv, current_cc)
 
         return plots
 
     ani = animation.FuncAnimation(fig, update_fig, nb_frames, interval=100, blit=True)
-    writer = animation.writers['pillow'](fps=fps)
+    writer = animation.FFMpegWriter(fps=fps)
 
-    dpi = 200
     if save_file is None:
-        save_file = 'animation.gif'
+        save_file = 'animation.mp4'
     ani.save(save_file, writer=writer, dpi=dpi)
 
     return ani
@@ -177,6 +167,22 @@ def create_animation(data, fps=10, scale=None, save_file=None):
     ani.save(save_file, writer=writer, dpi=dpi)
 
     return ani
+
+
+def to_np(x):
+    if isinstance(x, np.ndarray):
+        return x
+    return x.data.cpu().numpy()
+
+
+def convert_time(time_in_secs):
+
+    d = time_in_secs // 86400
+    h = (time_in_secs - d * 86400) // 3600
+    m = (time_in_secs - d * 86400 - h * 3600) // 60
+    s = time_in_secs - d * 86400 - h * 3600 - m * 60
+
+    print("\nd / hh:mm:ss   --->   %d / %d:%d:%d\n" % (d, h, m, s))
 
 
 def make_gif(data_to_plot, frames=None, interval=120, dt=25, fig_sz=(8, 6), dpi=100, sns_style=None,

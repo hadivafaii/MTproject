@@ -33,7 +33,7 @@ class Trainer:
         cuda_condition = torch.cuda.is_available() and train_config.use_cuda
         self.device = torch.device("cuda" if cuda_condition else "cpu")
 
-        self.model = model.to(self.device)
+        self.model = model.to(self.device).eval()
         self.config = model.config
         self.train_config = train_config
 
@@ -371,7 +371,7 @@ class Trainer:
                     to_np(torch.cat(x3_list)),
                 ),
                 "target": to_np(tgt),
-                "filters": to_np(fltr),
+                "filters": to_np(fltr) if len(fltr) else None,
             }
 
             save_dir = pjoin(_dir, keyword, experiment)
